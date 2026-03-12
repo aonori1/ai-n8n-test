@@ -1,0 +1,140 @@
+{
+  "projectName": "自動売買システム",
+  "description": "自動売買システム開発向けClaude Codeプロジェクト設定。Python中心、docs/src/testsを重視。設計書・意思決定ログ・スキルファイルを優先参照。ライブ取引自動実行は禁止。",
+  "language": "python",
+  "python": {
+    "version": "3.11",
+    "venv": ".venv",
+    "packageManager": "pip",
+    "dependencies": [
+      "numpy",
+      "pandas",
+      "pydantic",
+      "requests",
+      "aiohttp",
+      "ccxt",
+      "pytest",
+      "matplotlib"
+    ],
+    "devDependencies": [
+      "black",
+      "isort",
+      "ruff",
+      "mypy",
+      "pytest",
+      "pre-commit"
+    ],
+    "requirementsFile": "requirements.txt",
+    "devRequirementsFile": "requirements-dev.txt"
+  },
+  "folders": {
+    "docs": "docs",
+    "src": "src",
+    "tests": "tests",
+    "skills": "skills",
+    "design": "design",
+    "logs": "logs"
+  },
+  "entrypoint": "src/main.py",
+  "tests": {
+    "framework": "pytest",
+    "coverage": true,
+    "coverageConfig": {
+      "paths": [
+        "src"
+      ]
+    },
+    "testPattern": "tests/test_*.py"
+  },
+  "docs": {
+    "tool": "mkdocs",
+    "config": "docs/mkdocs.yml",
+    "emphasis": [
+      "設計書",
+      "意思決定ログ",
+      "スキルファイル"
+    ]
+  },
+  "ci": {
+    "enabled": true,
+    "workflowFile": ".github/workflows/ci.yml",
+    "commands": [
+      "python -m pip install --upgrade pip",
+      "pip install -r requirements-dev.txt",
+      "black --check .",
+      "ruff check .",
+      "mypy src || true",
+      "pytest --maxfail=1 --disable-warnings -q"
+    ]
+  },
+  "formatting": {
+    "formatter": "black",
+    "lineLength": 88,
+    "isort": true,
+    "ruff": true
+  },
+  "linting": {
+    "mypy": true,
+    "mypyStrict": false,
+    "ruff": true
+  },
+  "security": {
+    "allowNetwork": true,
+    "allowTradingExecution": false,
+    "allowedEnvironments": [
+      "backtest",
+      "paper",
+      "simulation"
+    ],
+    "forbiddenActions": [
+      "execute-live-orders",
+      "automated-fund-transfers",
+      "exfiltrate-credentials",
+      "modify-exchange-accounts"
+    ],
+    "credentialStorageRecommendations": "シークレットは環境変数または専用のシークレット管理を使用"
+  },
+  "priorities": {
+    "referenceOrder": [
+      "design",
+      "design/decisions.log",
+      "skills",
+      "src",
+      "docs",
+      "tests"
+    ],
+    "useDecisionLog": true,
+    "decisionLogPath": "design/decisions.log",
+    "skillFilesPath": "skills"
+  },
+  "templates": {
+    "moduleTemplate": "templates/module.py.tpl",
+    "testTemplate": "templates/test.py.tpl",
+    "docTemplate": "templates/doc.md.tpl"
+  },
+  "git": {
+    "gitignore": [
+      ".venv/",
+      "__pycache__/",
+      "*.pyc",
+      "*.pyo",
+      "*.pyd",
+      "*.log",
+      "data/",
+      "secrets.json",
+      ".env",
+      "build/",
+      "dist/"
+    ]
+  },
+  "metadata": {
+    "createdBy": "ClaudeCodeArchitect",
+    "focus": "自動売買システム開発",
+    "emphasis": [
+      "docs",
+      "src",
+      "tests"
+    ],
+    "safetyNote": "この設定はライブ取引の自動実行を行わない前提です。実運用時は必ず手動レビューと運用ガードを追加してください。"
+  }
+}
