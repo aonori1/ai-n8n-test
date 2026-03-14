@@ -1,415 +1,739 @@
 import logging
-import math
+import logging.handlers
 import json
+import math
+import os
+import sys
 from dataclasses import dataclass, field
-from typing import Dict, Optional, List, Any
+from datetime import datetime, timedelta
+from typing import Dict, Optional, List, Any, Tuple
+
 import numpy as np
 import pandas as pd
-from copy import deepcopy
-import datetime as dt
-
-# =========================
-# Configuration (preserve / editable)
-# =========================
-DEFAULT_CONFIG = {
-    "initial_capital": 100000.0,
-    "risk_per_trade": 0.01,                # fraction of capital to risk per trade
-    "max_drawdown_stop_pct": 0.20,         # stop trading if drawdown exceeds this fraction
-    "drawdown_recovery_pct": 0.05,         # resume trading once drawdown recovers to this level
-    "max_position_leverage": 1.0,          # max fraction of capital allocated to position (<=1 means no leverage)
-    "atr_period": 14,
-    "atr_multiplier_stop": 3.0,            # stop distance in ATRs
-    "atr_multiplier_trail": 1.5,           # trailing stop distance in ATRs
-    "ema_short": 20,
-    "ema_long": 50,
-    "adx_period": 14,
-    "adx_threshold": 20,                   # require trend strength above this for trend trades
-    "min_trade_holding_bars": 3,           # minimum bars to hold to avoid immediate whipsaws
-    "max_trade_holding_bars": 200,         # time-based exit
-    "position_size_floor": 0.0001,         # minimum position size in fraction of capital
-    "logging": {
-        "level": "INFO",
-        "format": "%(asctime)s %(levelname)s %(message)s"
-    }
-}
-
-# =========================
-# Logging setup function (preserve)
-# =========================
-def setup_logging(config_logging: Dict[str, Any]):
-    level = getattr(logging, config_logging.get("level", "INFO").upper(), logging.INFO)
-    logging.basicConfig(level=level, format=config_logging.get("format"))
-    return logging.getLogger("TradingSystem")
 
 
-# =========================
-# Indicators
-# =========================
-def ema(series: pd.Series, span: int) -> pd.Series:
-    return series.ewm(span=span, adjust=False).mean()
+# ----------------------------
+# Configuration handling
+# ----------------------------
+class Config:
+    """
+    Configuration manager. Loads config from a dictionary or JSON/YAML file path (JSON supported natively).
+    Provides default configuration for backtesting and risk management.
+    """
 
-
-def true_range(df: pd.DataFrame) -> pd.Series:
-    tr1 = df['high'] - df['low']
-    tr2 = (df['high'] - df['close'].shift(1)).abs()
-    tr3 = (df['low'] - df['close'].shift(1)).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    return tr
-
-
-def atr(df: pd.DataFrame, period: int) -> pd.Series:
-    tr = true_range(df)
-    return tr.rolling(period, min_periods=1).mean()
-
-
-def directional_indicators(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
-    # Simplified ADX calculation
-    up_move = df['high'].diff()
-    down_move = -df['low'].diff()
-    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-    tr = true_range(df)
-    atr_series = tr.rolling(period, min_periods=1).mean()
-
-    plus_di = 100 * (pd.Series(plus_dm).rolling(period, min_periods=1).sum() / atr_series.replace(0, np.nan))
-    minus_di = 100 * (pd.Series(minus_dm).rolling(period, min_periods=1).sum() / atr_series.replace(0, np.nan))
-    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
-    adx = dx.rolling(period, min_periods=1).mean().fillna(0)
-    out = pd.DataFrame({
-        'plus_di': plus_di.fillna(0),
-        'minus_di': minus_di.fillna(0),
-        'adx': adx
-    }, index=df.index)
-    return out
-
-
-# =========================
-# Utilities / Metrics
-# =========================
-def compute_performance(equity_curve: pd.Series, risk_free_rate_annual=0.0) -> Dict[str, Any]:
-    returns = equity_curve.pct_change().fillna(0)
-    total_return = equity_curve.iloc[-1] / equity_curve.iloc[0] - 1.0
-    days = (equity_curve.index[-1] - equity_curve.index[0]).days if isinstance(equity_curve.index[0], pd.Timestamp) else len(equity_curve)
-    years = max(days / 365.25, 1/252)
-    cagr = (equity_curve.iloc[-1] / equity_curve.iloc[0]) ** (1 / years) - 1
-    ann_vol = returns.std() * np.sqrt(252)
-    sharpe = (cagr - risk_free_rate_annual) / ann_vol if ann_vol != 0 else np.nan
-    # Sortino
-    neg_returns = returns[returns < 0]
-    downside_vol = neg_returns.std() * np.sqrt(252)
-    sortino = (cagr - risk_free_rate_annual) / downside_vol if downside_vol != 0 else np.nan
-    peak = equity_curve.cummax()
-    drawdown = (equity_curve - peak) / peak
-    max_dd = drawdown.min()
-    return {
-        'total_return': total_return,
-        'cagr': cagr,
-        'ann_vol': ann_vol,
-        'sharpe': sharpe,
-        'sortino': sortino,
-        'max_drawdown': max_dd,
-        'equity_curve': equity_curve,
-        'returns': returns
+    DEFAULT = {
+        "logging": {
+            "level": "INFO",
+            "file": "backtest.log",
+            "max_bytes": 10 * 1024 * 1024,
+            "backup_count": 3
+        },
+        "backtest": {
+            "start_cash": 100000.0,
+            "commission_per_share": 0.0,
+            "slippage_pct": 0.0,
+            "data_frequency": "1D"
+        },
+        "risk": {
+            "risk_per_trade": 0.01,   # fraction of equity to risk per trade
+            "max_drawdown": 0.2,      # maximum allowed drawdown fraction before halting trading
+            "max_exposure": 1.0,      # maximum portfolio exposure (fraction of equity)
+            "max_position_size": 0.5, # maximum single position size (fraction of equity)
+            "daily_loss_limit": 0.02  # fraction of equity daily loss limit
+        },
+        "strategy": {
+            "fast_window": 20,
+            "slow_window": 50,
+            "use_atr": True,
+            "atr_window": 14,
+            "fixed_size": None       # override dynamic sizing, number of shares if set
+        }
     }
 
+    def __init__(self, config_source: Optional[str] = None, overrides: Optional[Dict[str, Any]] = None):
+        """
+        config_source: Optional path to JSON config file.
+        overrides: Optional dict to merge on top of defaults.
+        """
+        self.config = dict(Config.DEFAULT)
+        if config_source:
+            self._load_from_file(config_source)
+        if overrides:
+            self._deep_update(self.config, overrides)
 
-# =========================
-# Trading system core (preserve architecture)
-# =========================
-@dataclass
-class Trade:
-    entry_date: pd.Timestamp
-    entry_price: float
-    size: float                    # number of shares/contracts (positive for long, negative for short)
-    direction: int                 # 1 long, -1 short
-    stop: float
-    trail_stop: Optional[float] = None
-    exit_date: Optional[pd.Timestamp] = None
-    exit_price: Optional[float] = None
-    pnl: Optional[float] = None
-    holding_bars: int = 0
+    def _load_from_file(self, path: str):
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Config file not found: {path}")
+        with open(path, 'r') as f:
+            # Support JSON only for now (YAML could be added)
+            cfg = json.load(f)
+            self._deep_update(self.config, cfg)
+
+    @staticmethod
+    def _deep_update(dest: Dict[str, Any], upd: Dict[str, Any]):
+        for k, v in upd.items():
+            if isinstance(v, dict) and k in dest and isinstance(dest[k], dict):
+                Config._deep_update(dest[k], v)
+            else:
+                dest[k] = v
+
+    def get(self, path: str, default: Any = None) -> Any:
+        """
+        Get nested config value by dot-separated path, e.g., 'risk.max_drawdown'
+        """
+        parts = path.split('.')
+        cur = self.config
+        for p in parts:
+            if not isinstance(cur, dict) or p not in cur:
+                return default
+            cur = cur[p]
+        return cur
+
+    def as_dict(self):
+        return self.config
 
 
-@dataclass
-class TradingSystem:
-    config: Dict[str, Any] = field(default_factory=lambda: deepcopy(DEFAULT_CONFIG))
-    logger: logging.Logger = field(init=False)
+# ----------------------------
+# Logging
+# ----------------------------
+def setup_logging(cfg: Config):
+    cfg_dict = cfg.as_dict()
+    log_cfg = cfg_dict.get('logging', {})
+    level = getattr(logging, log_cfg.get('level', 'INFO').upper(), logging.INFO)
+    log_file = log_cfg.get('file', 'backtest.log')
+    max_bytes = log_cfg.get('max_bytes', 10 * 1024 * 1024)
+    backup_count = log_cfg.get('backup_count', 3)
 
-    def __post_init__(self):
-        self.logger = setup_logging(self.config.get("logging", {}))
-        self.logger.info("TradingSystem initialized with config: %s", json.dumps(self.config, default=str))
-        # Internal runtime state
-        self.equity = self.config["initial_capital"]
-        self.max_equity = self.equity
-        self.trades: List[Trade] = []
-        self.current_trade: Optional[Trade] = None
-        self.stopped_from_drawdown = False
+    logger = logging.getLogger()
+    logger.setLevel(level)
+
+    # Clear existing handlers
+    if logger.handlers:
+        for h in list(logger.handlers):
+            logger.removeHandler(h)
+
+    # Console handler
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setLevel(level)
+    ch.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
+    logger.addHandler(ch)
+
+    # Rotating file handler
+    fh = logging.handlers.RotatingFileHandler(log_file, maxBytes=max_bytes, backupCount=backup_count)
+    fh.setLevel(level)
+    fh.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
+    logger.addHandler(fh)
+
+    logging.debug("Logging initialized (level=%s file=%s)", logging.getLevelName(level), log_file)
+    return logger
+
+
+# ----------------------------
+# Data handling
+# ----------------------------
+class DataHandler:
+    """
+    Simple data handler that holds DataFrame of OHLCV data for a single symbol.
+    Expects index to be datetime-like and columns to include: Open, High, Low, Close, Volume
+    """
+
+    REQUIRED_COLS = ["Open", "High", "Low", "Close", "Volume"]
+
+    def __init__(self, df: pd.DataFrame):
+        if not isinstance(df, pd.DataFrame):
+            raise ValueError("df must be a pandas DataFrame")
+        for c in DataHandler.REQUIRED_COLS:
+            if c not in df.columns:
+                raise ValueError(f"Missing required column: {c}")
+        df = df.copy()
+        if not pd.api.types.is_datetime64_any_dtype(df.index):
+            raise ValueError("DataFrame index must be datetime")
+        df.sort_index(inplace=True)
+        self.df = df
+        self._n = len(df)
+        self._pos = 0
 
     def reset(self):
-        self.equity = self.config["initial_capital"]
-        self.max_equity = self.equity
-        self.trades = []
-        self.current_trade = None
-        self.stopped_from_drawdown = False
-        self.logger.info("System reset")
+        self._pos = 0
 
-    def compute_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        df = df.copy()
-        df['ema_short'] = ema(df['close'], self.config['ema_short'])
-        df['ema_long'] = ema(df['close'], self.config['ema_long'])
-        df['atr'] = atr(df, self.config['atr_period'])
-        di = directional_indicators(df, self.config['adx_period'])
-        df = df.join(di)
-        # Signal: ema crossover when ADX indicates a trend
-        df['signal_raw'] = 0
-        df.loc[df['ema_short'] > df['ema_long'], 'signal_raw'] = 1
-        df.loc[df['ema_short'] < df['ema_long'], 'signal_raw'] = -1
-        df['signal'] = 0
-        # Only take signals when ADX shows trend strength
-        df.loc[(df['signal_raw'] == 1) & (df['adx'] >= self.config['adx_threshold']), 'signal'] = 1
-        df.loc[(df['signal_raw'] == -1) & (df['adx'] >= self.config['adx_threshold']), 'signal'] = -1
-        # If ADX low, optionally no trade (reduce whipsaw)
+    def __len__(self):
+        return self._n
+
+    def get_latest_bar(self) -> Tuple[pd.Timestamp, pd.Series]:
+        if self._pos >= self._n:
+            raise IndexError("End of data")
+        ts = self.df.index[self._pos]
+        row = self.df.iloc[self._pos]
+        return ts, row
+
+    def step(self):
+        if self._pos < self._n - 1:
+            self._pos += 1
+            return True
+        self._pos = self._n
+        return False
+
+    def get_slice_up_to(self, pos: Optional[int] = None) -> pd.DataFrame:
+        if pos is None:
+            pos = self._pos
+        return self.df.iloc[:pos + 1]
+
+
+# ----------------------------
+# Orders and Trades
+# ----------------------------
+@dataclass
+class Order:
+    symbol: str
+    quantity: int
+    side: str  # 'BUY' or 'SELL'
+    price: float
+    timestamp: pd.Timestamp
+    order_type: str = "MARKET"
+
+
+@dataclass
+class Trade:
+    symbol: str
+    quantity: int
+    side: str
+    price: float
+    timestamp: pd.Timestamp
+    commission: float
+
+
+# ----------------------------
+# Strategy
+# ----------------------------
+class Strategy:
+    """
+    Base strategy interface.
+    """
+
+    def on_bar(self, bar_ts: pd.Timestamp, bar: pd.Series, history: pd.DataFrame) -> Optional[Dict[str, Any]]:
+        """
+        Called every bar. Should return:
+            None or {} -> do nothing
+            {'signal': 1/-1, 'stop_loss_pct': 0.02, 'take_profit_pct': 0.04}
+        """
+        raise NotImplementedError()
+
+
+class MovingAverageCrossStrategy(Strategy):
+    """
+    Simple moving average crossover:
+      - Go long when fast MA crosses above slow MA
+      - Exit when fast MA crosses below slow MA
+    """
+
+    def __init__(self, cfg: Config):
+        self.fast_window = cfg.get("strategy.fast_window")
+        self.slow_window = cfg.get("strategy.slow_window")
+        self.atr_window = cfg.get("strategy.atr_window", 14)
+        self.use_atr = cfg.get("strategy.use_atr", True)
+        self.fixed_size = cfg.get("strategy.fixed_size", None)
+        # state
+        self._position = 0
+
+    def _compute_indicators(self, history: pd.DataFrame) -> pd.DataFrame:
+        df = history.copy()
+        df['fast_ma'] = df['Close'].rolling(self.fast_window, min_periods=1).mean()
+        df['slow_ma'] = df['Close'].rolling(self.slow_window, min_periods=1).mean()
+        # ATR approx
+        high_low = df['High'] - df['Low']
+        high_close = (df['High'] - df['Close'].shift(1)).abs()
+        low_close = (df['Low'] - df['Close'].shift(1)).abs()
+        tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+        df['atr'] = tr.rolling(self.atr_window, min_periods=1).mean()
         return df
 
-    def _size_position(self, capital: float, price: float, atr: float, direction: int) -> float:
-        """Size position using fixed fractional risk and ATR for stop distance."""
-        risk_per_trade = self.config['risk_per_trade'] * capital
-        stop_distance = max(atr * self.config['atr_multiplier_stop'], price * 0.001)  # tiny minimum
-        if stop_distance <= 0:
-            self.logger.warning("Stop distance computed as zero or negative. Defaulting to small positive.")
-            stop_distance = price * 0.001
-        # number of units to risk risk_per_trade given stop distance
-        size = math.floor((risk_per_trade / stop_distance) / 1.0)  # assumes 1 contract/lot priced at 1 price move = 1 unit pnl
-        # enforce leverage cap: position value = size * price
-        max_position_value = self.config['max_position_leverage'] * capital
-        max_size_by_value = math.floor(max_position_value / price) if price > 0 else 0
-        final_size = int(max(0, min(size, max_size_by_value)))
-        if final_size == 0:
-            # fallback to minimal fractional position so small trades can still occur
-            fallback_size = int(max(1, math.floor((self.config['position_size_floor'] * capital) / price)))
-            final_size = fallback_size
-        return final_size
+    def on_bar(self, bar_ts: pd.Timestamp, bar: pd.Series, history: pd.DataFrame) -> Optional[Dict[str, Any]]:
+        df = self._compute_indicators(history)
+        last = df.iloc[-1]
+        prev = df.iloc[-2] if len(df) >= 2 else None
 
-    def _enter_trade(self, date: pd.Timestamp, price: float, direction: int, atr: float):
-        size = self._size_position(self.equity, price, atr, direction)
-        stop = price - direction * (atr * self.config['atr_multiplier_stop'])
-        if direction == -1:
-            # for short, stop is above entry
-            stop = price + abs(direction) * (atr * self.config['atr_multiplier_stop'])
-        trade = Trade(entry_date=date, entry_price=price, size=size, direction=direction, stop=stop, trail_stop=None)
-        self.current_trade = trade
-        self.logger.info("ENTER %s trade @ %s price=%.4f size=%d stop=%.4f equity=%.2f",
-                         "LONG" if direction == 1 else "SHORT", date, price, size, stop, self.equity)
+        signal = 0
+        # Entry condition
+        if prev is not None:
+            if prev['fast_ma'] <= prev['slow_ma'] and last['fast_ma'] > last['slow_ma']:
+                signal = 1
+            elif prev['fast_ma'] >= prev['slow_ma'] and last['fast_ma'] < last['slow_ma']:
+                signal = -1
 
-    def _exit_trade(self, date: pd.Timestamp, price: float, reason: str):
-        t = self.current_trade
-        if t is None:
-            return
-        t.exit_date = date
-        t.exit_price = price
-        # PnL calculation: direction * (exit - entry) * size
-        t.pnl = t.direction * (t.exit_price - t.entry_price) * t.size
-        self.equity += t.pnl
-        self.max_equity = max(self.max_equity, self.equity)
-        self.trades.append(t)
-        self.logger.info("EXIT %s trade @ %s price=%.4f size=%d pnl=%.2f reason=%s equity=%.2f",
-                         "LONG" if t.direction == 1 else "SHORT", date, price, t.size, t.pnl, reason, self.equity)
-        self.current_trade = None
-
-    def _update_trailing_and_check_stop(self, row: pd.Series) -> Optional[str]:
-        """Update trailing stop and check if exit conditions met. Returns exit reason or None."""
-        t = self.current_trade
-        if t is None:
-            return None
-        price = row['close']
-        atr_val = row['atr']
-        # Update holding bars
-        t.holding_bars += 1
-        # Initialize trailing stop on first update
-        trail_distance = atr_val * self.config['atr_multiplier_trail']
-        if t.trail_stop is None:
-            if t.direction == 1:
-                t.trail_stop = t.entry_price - trail_distance
+        if signal == 1:
+            # Enter long
+            self._position = 1
+            # Suggest stop loss based on ATR or percent
+            if self.use_atr and last['atr'] > 0 and not np.isnan(last['atr']):
+                stop_loss_pct = (last['atr'] * 2) / last['Close']  # 2 ATR stop
             else:
-                t.trail_stop = t.entry_price + trail_distance
+                stop_loss_pct = 0.02
+            return {'signal': 1, 'stop_loss_pct': float(stop_loss_pct), 'take_profit_pct': float(stop_loss_pct * 2)}
+        elif signal == -1:
+            # Exit or go short; for simplicity treat as exit (close long)
+            self._position = 0
+            return {'signal': -1}
         else:
-            # For long, trail_stop only moves up; for short, only moves down
-            if t.direction == 1:
-                new_trail = price - trail_distance
-                if new_trail > t.trail_stop:
-                    t.trail_stop = new_trail
+            return None
+
+
+# ----------------------------
+# Risk Management
+# ----------------------------
+class RiskManager:
+    """
+    Risk manager used to validate and size orders.
+    """
+
+    def __init__(self, cfg: Config):
+        self.risk_per_trade = cfg.get("risk.risk_per_trade")
+        self.max_drawdown = cfg.get("risk.max_drawdown")
+        self.max_exposure = cfg.get("risk.max_exposure")
+        self.max_position_size = cfg.get("risk.max_position_size")
+        self.daily_loss_limit = cfg.get("risk.daily_loss_limit")
+        self.start_cash = cfg.get("backtest.start_cash")
+
+    def validate_and_size(self,
+                          portfolio: 'Portfolio',
+                          signal: int,
+                          price: float,
+                          stop_loss_pct: Optional[float] = None,
+                          fixed_size: Optional[int] = None) -> Optional[int]:
+        """
+        Return integer number of shares to buy/sell. Return None if order should be rejected.
+        For long entries (signal == 1) compute position sizing dynamically:
+           size = floor( (equity * risk_per_trade) / (stop_loss_amount) )
+        For exits (signal == -1), size will be current position size (to close).
+        Apply exposure and max position size limits.
+
+        portfolio: current portfolio
+        price: current price to size against
+        stop_loss_pct: fractional stop loss (e.g., 0.02)
+        fixed_size: optional override number of shares
+        """
+        current_equity = portfolio.equity
+        if current_equity <= 0:
+            logging.warning("Portfolio equity non-positive: %s", current_equity)
+            return None
+
+        # Check drawdown stop
+        if portfolio.max_drawdown_exceeded(self.max_drawdown):
+            logging.warning("Max drawdown exceeded: %.2f > %.2f", portfolio.max_drawdown(), self.max_drawdown)
+            return None
+
+        # Check daily loss limit
+        if portfolio.daily_loss_exceeded(self.daily_loss_limit):
+            logging.warning("Daily loss limit exceeded: %.4f > %.4f", portfolio.daily_loss(), self.daily_loss_limit)
+            return None
+
+        if signal == -1:
+            # closing position: return negative of current position to flatten
+            pos = portfolio.get_position_quantity()
+            if pos == 0:
+                return None
+            return -pos
+
+        if signal == 1:
+            # Entry sizing
+            if fixed_size is not None:
+                size = fixed_size
             else:
-                new_trail = price + trail_distance
-                if new_trail < t.trail_stop:
-                    t.trail_stop = new_trail
+                # Determine stop distance
+                if stop_loss_pct is None or stop_loss_pct <= 0:
+                    # fallback percent
+                    stop_loss_pct = 0.02
+                stop_amount = price * stop_loss_pct
+                if stop_amount <= 0:
+                    logging.warning("Stop amount computed 0 or negative, rejecting order.")
+                    return None
+                risk_amount = current_equity * self.risk_per_trade
+                raw_size = math.floor(risk_amount / stop_amount)
+                size = max(0, raw_size)
 
-        # Hard stop check
-        if t.direction == 1 and price <= t.stop:
-            return "hard_stop"
-        if t.direction == -1 and price >= t.stop:
-            return "hard_stop"
+            if size <= 0:
+                logging.info("Calculated position size is zero; skipping trade.")
+                return None
 
-        # Trailing stop check
-        if t.direction == 1 and price <= t.trail_stop:
-            return "trail_stop"
-        if t.direction == -1 and price >= t.trail_stop:
-            return "trail_stop"
+            # Apply position size limits (in currency)
+            proposed_position_value = size * price
+            if proposed_position_value > current_equity * self.max_position_size:
+                size = math.floor((current_equity * self.max_position_size) / price)
+                logging.debug("Capped size by max_position_size to %s", size)
 
-        # Time-based exit
-        if t.holding_bars >= self.config['max_trade_holding_bars']:
-            return "time_exit"
+            # Apply overall exposure limit
+            total_exposure = (portfolio.current_exposure() + proposed_position_value) / current_equity
+            if total_exposure > self.max_exposure:
+                # reduce to fit exposure
+                available_exposure_value = self.max_exposure * current_equity - portfolio.current_exposure()
+                if available_exposure_value <= 0:
+                    logging.info("No exposure available; skipping trade.")
+                    return None
+                size = math.floor(available_exposure_value / price)
+                logging.debug("Capped size by max_exposure to %s", size)
 
+            if size <= 0:
+                logging.info("Final computed size is zero after applying limits.")
+                return None
+
+            return int(size)
+
+        logging.debug("Signal neither 1 nor -1: %s", signal)
         return None
 
-    def _check_and_maybe_stop_trading_due_to_drawdown(self):
-        # If drawdown too large, stop trading until recovery
-        dd = (self.max_equity - self.equity) / max(1.0, self.max_equity)
-        if not self.stopped_from_drawdown and dd >= self.config['max_drawdown_stop_pct']:
-            self.stopped_from_drawdown = True
-            self.logger.warning("Trading suspended due to drawdown %.2f%% >= threshold %.2f%%",
-                                dd * 100, self.config['max_drawdown_stop_pct'] * 100)
-        elif self.stopped_from_drawdown:
-            # check recovery
-            recovery = (self.equity - (self.max_equity * (1 - self.config['max_drawdown_stop_pct']))) / max(1.0, self.max_equity)
-            if recovery >= self.config['drawdown_recovery_pct']:
-                self.stopped_from_drawdown = False
-                self.logger.info("Trading resumed after recovery: recovery metric %.4f", recovery)
 
-    def run_backtest(self, df: pd.DataFrame) -> Dict[str, Any]:
+# ----------------------------
+# Execution Handler (Simulator)
+# ----------------------------
+class ExecutionHandler:
+    """
+    Simulates immediate market fills at provided fill_price with commission and slippage.
+    """
+
+    def __init__(self, cfg: Config):
+        self.commission_per_share = cfg.get("backtest.commission_per_share")
+        self.slippage_pct = cfg.get("backtest.slippage_pct")
+
+    def execute_order(self, order: Order, bar: pd.Series) -> Trade:
         """
-        Main backtest loop. Dataframe must contain open/high/low/close and datetime index.
-        Architecture preserved: indicators computed, signals generated, trades tracked, logging preserved.
+        Simulate execution. For market order we'll assume fill at bar['Open'] if available or bar['Close'].
+        Apply slippage and commission.
         """
-        df = df.copy()
-        if not isinstance(df.index, pd.DatetimeIndex):
+        # Determine fill price: use next bar Open (provided by caller as bar)
+        base_price = float(bar.get('Open', order.price) if 'Open' in bar else order.price)
+        # slippage in price terms
+        slippage = base_price * self.slippage_pct * (1 if order.side == 'BUY' else -1)
+        fill_price = base_price + slippage
+        commission = abs(order.quantity) * self.commission_per_share
+        logging.info("Executed %s %d @ %.4f (slippage=%.4f commission=%.4f)", order.side, order.quantity, fill_price, slippage, commission)
+        return Trade(symbol=order.symbol, quantity=order.quantity, side=order.side, price=fill_price, timestamp=order.timestamp, commission=commission)
+
+
+# ----------------------------
+# Portfolio and Accounting
+# ----------------------------
+class Portfolio:
+    """
+    Very lightweight portfolio for single-symbol backtest.
+    Tracks cash, positions, PnL, equity, and trade log.
+    """
+
+    def __init__(self, start_cash: float):
+        self.start_cash = float(start_cash)
+        self.cash = float(start_cash)
+        self.position = 0  # signed integer share count (positive = long)
+        self.position_entry_price = 0.0  # average entry price for current position
+        self._trade_history: List[Trade] = []
+        self._equity_history: List[Tuple[pd.Timestamp, float]] = []
+        self._daily_pnl: Dict[pd.Timestamp, float] = {}  # date -> pnl for that date
+        self._peak_equity = start_cash
+        self._lowest_equity_since_peak = start_cash
+
+    def current_exposure(self) -> float:
+        return abs(self.position) * (self.position_entry_price if self.position_entry_price > 0 else 0.0)
+
+    def get_position_quantity(self) -> int:
+        return int(self.position)
+
+    def record_trade(self, trade: Trade):
+        # update cash and position
+        qty = int(trade.quantity)
+        notional = qty * trade.price
+        if trade.side == 'BUY':
+            self.cash -= (notional + trade.commission)
+            # update average entry price
+            if self.position + qty == 0:
+                self.position_entry_price = 0.0
+            elif self.position == 0:
+                self.position_entry_price = trade.price
+            else:
+                # Weighted average for adding to existing position
+                existing_notional = self.position * self.position_entry_price
+                new_notional = existing_notional + notional
+                new_qty = self.position + qty
+                if new_qty != 0:
+                    self.position_entry_price = new_notional / new_qty
+            self.position += qty
+        elif trade.side == 'SELL':
+            self.cash += (notional - trade.commission)
+            # if closing or reducing position adjust entry price if crossing to net short is allowed
+            if self.position - qty == 0:
+                self.position_entry_price = 0.0
+            self.position -= qty
+        else:
+            raise ValueError("Unknown trade side: %s" % trade.side)
+
+        self._trade_history.append(trade)
+        logging.debug("Trade recorded. Position=%d EntryPrice=%.4f Cash=%.2f", self.position, self.position_entry_price, self.cash)
+
+    def update_equity(self, timestamp: pd.Timestamp, mark_price: float):
+        """
+        Compute current equity and record history.
+        """
+        position_value = self.position * mark_price
+        equity = self.cash + position_value
+        self._equity_history.append((timestamp, equity))
+        # Update peak and drawdown trackers
+        if equity > self._peak_equity:
+            self._peak_equity = equity
+            self._lowest_equity_since_peak = equity
+        else:
+            if equity < self._lowest_equity_since_peak:
+                self._lowest_equity_since_peak = equity
+        # Update daily pnl
+        date = timestamp.normalize()
+        prev_equity = self._equity_history[-2][1] if len(self._equity_history) >= 2 else self.start_cash
+        pnl = equity - prev_equity
+        self._daily_pnl[date] = self._daily_pnl.get(date, 0.0) + pnl
+        logging.debug("Equity updated: %s -> %.2f (position_value=%.2f)", timestamp, equity, position_value)
+
+    def equity(self) -> float:
+        if not self._equity_history:
+            return self.start_cash
+        return self._equity_history[-1][1]
+
+    def max_drawdown(self) -> float:
+        # Simple max drawdown from equity history
+        if not self._equity_history:
+            return 0.0
+        eqs = np.array([e for _, e in self._equity_history])
+        peaks = np.maximum.accumulate(eqs)
+        drawdowns = (peaks - eqs) / peaks
+        return float(np.max(drawdowns)) if len(drawdowns) > 0 else 0.0
+
+    def max_drawdown_exceeded(self, allowed: float) -> bool:
+        return self.max_drawdown() > allowed
+
+    def daily_loss(self) -> float:
+        # compute latest day's loss as fraction of equity start of day
+        if not self._equity_history:
+            return 0.0
+        # find today's date
+        last_ts, last_eq = self._equity_history[-1]
+        date = last_ts.normalize()
+        day_start_eq = None
+        # find equity at first timestamp of that date
+        for ts, eq in self._equity_history:
+            if ts.normalize() == date:
+                if day_start_eq is None:
+                    day_start_eq = eq
+        if day_start_eq is None:
+            day_start_eq = last_eq
+        if day_start_eq <= 0:
+            return 0.0
+        loss = max(0.0, day_start_eq - last_eq) / day_start_eq
+        return float(loss)
+
+    def daily_loss_exceeded(self, limit: float) -> bool:
+        return self.daily_loss() > limit
+
+    def trades(self) -> List[Trade]:
+        return self._trade_history
+
+    def equity_series(self) -> pd.Series:
+        if not self._equity_history:
+            return pd.Series(dtype=float)
+        idx = pd.DatetimeIndex([ts for ts, _ in self._equity_history])
+        vals = [v for _, v in self._equity_history]
+        return pd.Series(data=vals, index=idx)
+
+
+# ----------------------------
+# Performance Metrics
+# ----------------------------
+def performance_metrics(equity_series: pd.Series, start_cash: float) -> Dict[str, Any]:
+    """
+    Compute simple performance metrics: total return, CAGR, sharpe (daily), max drawdown.
+    """
+    metrics: Dict[str, Any] = {}
+    if equity_series.empty:
+        metrics.update({
+            "total_return": 0.0,
+            "cagr": 0.0,
+            "sharpe": 0.0,
+            "max_drawdown": 0.0
+        })
+        return metrics
+
+    returns = equity_series.pct_change().fillna(0.0)
+    total_return = (equity_series.iloc[-1] / start_cash) - 1.0
+    days = (equity_series.index[-1] - equity_series.index[0]).days or 1
+    cagr = (equity_series.iloc[-1] / start_cash) ** (365.0 / days) - 1.0
+    # Sharpe ratio using daily returns and zero risk-free
+    if returns.std() != 0:
+        sharpe = (returns.mean() / returns.std()) * math.sqrt(252)
+    else:
+        sharpe = 0.0
+    # Max drawdown
+    peaks = equity_series.cummax()
+    drawdown = ((peaks - equity_series) / peaks).max()
+    metrics.update({
+        "total_return": float(total_return),
+        "cagr": float(cagr),
+        "sharpe": float(sharpe),
+        "max_drawdown": float(drawdown)
+    })
+    return metrics
+
+
+# ----------------------------
+# Backtester orchestrator
+# ----------------------------
+class Backtester:
+    """
+    Coordinates data, strategy, risk manager, execution handler and portfolio for backtesting.
+    Single symbol event-driven simulation.
+    """
+
+    def __init__(self, df: pd.DataFrame, cfg: Optional[Config] = None):
+        self.cfg = cfg or Config()
+        setup_logging(self.cfg)
+        self.data = DataHandler(df)
+        self.strategy = MovingAverageCrossStrategy(self.cfg)
+        self.risk_manager = RiskManager(self.cfg)
+        self.exec_handler = ExecutionHandler(self.cfg)
+        self.portfolio = Portfolio(start_cash=self.cfg.get("backtest.start_cash"))
+        self.symbol = "SYM"
+        self.logger = logging.getLogger(__name__)
+
+    def run(self):
+        self.logger.info("Starting backtest with %d bars", len(self.data))
+        self.data.reset()
+        # Initialize with first bar mark
+        pos = 0
+        while True:
             try:
-                df.index = pd.to_datetime(df.index)
-            except Exception:
-                # keep as-is if cannot parse
-                pass
-        df.sort_index(inplace=True)
-        df = self.compute_indicators(df)
-        equity_curve = []
-        dates = []
+                ts, bar = self.data.get_latest_bar()
+            except IndexError:
+                break
+            history = self.data.get_slice_up_to(self.data._pos)
+            # Ask strategy
+            try:
+                decision = self.strategy.on_bar(ts, bar, history)
+            except Exception as e:
+                logging.exception("Strategy error at %s: %s", ts, e)
+                decision = None
 
-        # iterate rows
-        for idx, row in df.iterrows():
-            price = row['close']
-            date = idx
+            if decision:
+                signal = int(decision.get('signal', 0))
+                stop_loss_pct = decision.get('stop_loss_pct', None)
+                fixed_size = self.cfg.get("strategy.fixed_size")
+                size = self.risk_manager.validate_and_size(self.portfolio, signal, float(bar['Close']), stop_loss_pct, fixed_size)
+                if size is not None and size != 0:
+                    # Create order
+                    side = 'BUY' if size > 0 else 'SELL'
+                    order = Order(symbol=self.symbol, quantity=abs(size), side=side, price=float(bar['Close']), timestamp=ts)
+                    # Execute
+                    try:
+                        trade = self.exec_handler.execute_order(order, bar)
+                        self.portfolio.record_trade(trade)
+                    except Exception as e:
+                        logging.exception("Execution failed: %s", e)
+                else:
+                    logging.debug("Order not created (size=%s)", size)
 
-            # Update current trade trailing stops / check exits
-            if self.current_trade is not None:
-                exit_reason = self._update_trailing_and_check_stop(row)
-                # Enforce minimum holding bars to avoid immediate flips
-                if exit_reason is None and self.current_trade.holding_bars < self.config['min_trade_holding_bars']:
-                    exit_reason = None  # don't exit even if signal flips immediately
-                if exit_reason is not None:
-                    # execute exit at current price
-                    self._exit_trade(date, price, exit_reason)
+            # Update portfolio mark-to-market with bar close
+            self.portfolio.update_equity(ts, float(bar['Close']))
+            # Advance data
+            if not self.data.step():
+                break
 
-            # Check and possibly suspend/resume trading due to drawdown
-            self._check_and_maybe_stop_trading_due_to_drawdown()
-
-            # Generate signals and enter if none open
-            signal = int(row.get('signal', 0))
-            if self.current_trade is None and not self.stopped_from_drawdown:
-                # Only enter if signal exists and not in drawdown suspension
-                if signal != 0:
-                    # additional filter: don't flip on weak ADX or price too close to previous exit to avoid noise
-                    # enter trade
-                    self._enter_trade(date, price, signal, row['atr'])
-            # If a trade is open and a new opposite signal appears after min holding, consider reversing
-            elif self.current_trade is not None and signal != 0 and signal != self.current_trade.direction:
-                if self.current_trade.holding_bars >= self.config['min_trade_holding_bars']:
-                    # Exit current at market then enter new (reduces drawdown risk by forcing stops on reversals)
-                    self._exit_trade(date, price, reason="signal_reversal")
-                    # After exit, check drawdown suspension before re-enter
-                    self._check_and_maybe_stop_trading_due_to_drawdown()
-                    if not self.stopped_from_drawdown:
-                        self._enter_trade(date, price, signal, row['atr'])
-
-            # Record equity
-            equity_curve.append(self.equity)
-            dates.append(date)
-
-        equity_series = pd.Series(data=equity_curve, index=dates)
-        performance = compute_performance(equity_series)
-        self.logger.info("Backtest completed. Total return: %.2f%% Max Drawdown: %.2f%% Sharpe: %.2f",
-                         performance['total_return'] * 100,
-                         performance['max_drawdown'] * 100,
-                         performance['sharpe'] if not np.isnan(performance['sharpe']) else -999)
+        # Final metrics
+        eq_series = self.portfolio.equity_series()
+        metrics = performance_metrics(eq_series, self.portfolio.start_cash)
+        self.logger.info("Backtest finished. Metrics: %s", metrics)
         return {
-            'performance': performance,
-            'trades': self.trades,
-            'equity_curve': equity_series
+            "metrics": metrics,
+            "equity_curve": eq_series,
+            "trades": self.portfolio.trades()
         }
 
 
-# =========================
-# Example usage helper (keeps config/logging)
-# =========================
-def load_config(path: Optional[str] = None) -> Dict[str, Any]:
-    config = deepcopy(DEFAULT_CONFIG)
-    if path:
-        try:
-            with open(path, 'r') as f:
-                user_config = json.load(f)
-            # shallow update - preserve unknown keys in user_config
-            config.update(user_config)
-        except Exception as e:
-            logging.getLogger("TradingSystem").warning("Failed to load config from %s, using defaults. Error: %s", path, e)
-    return config
+# ----------------------------
+# Utilities: sample data generator
+# ----------------------------
+def generate_synthetic_data(start: str = "2020-01-01", periods: int = 500, seed: int = 42) -> pd.DataFrame:
+    """
+    Generate synthetic OHLCV data as a geometric Brownian motion for testing/backtesting.
+    """
+    rng = np.random.RandomState(seed)
+    dates = pd.date_range(start=start, periods=periods, freq='D')
+    price = 100.0
+    mu = 0.0002
+    sigma = 0.02
+    prices = []
+    for _ in range(periods):
+        shock = rng.normal(loc=mu, scale=sigma)
+        price = price * math.exp(shock)
+        prices.append(price)
+    close = np.array(prices)
+    open_ = close * (1 + rng.normal(0, 0.001, size=periods))
+    high = np.maximum(open_, close) * (1 + np.abs(rng.normal(0, 0.002, size=periods)))
+    low = np.minimum(open_, close) * (1 - np.abs(rng.normal(0, 0.002, size=periods)))
+    volume = rng.randint(100, 1000, size=periods)
+    df = pd.DataFrame({"Open": open_, "High": high, "Low": low, "Close": close, "Volume": volume}, index=dates)
+    return df
 
 
-# =========================
-# Module test / Backtest runner (can be used by existing architecture)
-# =========================
+# ----------------------------
+# Example run for manual testing
+# ----------------------------
 if __name__ == "__main__":
-    # This block is for quick local tests only. In production the system integrates into the existing architecture.
-    import sys
-    import argparse
+    # Create config with sensible parameters for demonstration
+    overrides = {
+        "logging": {
+            "level": "INFO",
+            "file": "demo_backtest.log"
+        },
+        "backtest": {
+            "start_cash": 100000.0,
+            "commission_per_share": 0.01,
+            "slippage_pct": 0.0005
+        },
+        "risk": {
+            "risk_per_trade": 0.005,
+            "max_drawdown": 0.25,
+            "max_exposure": 1.0,
+            "max_position_size": 0.5,
+            "daily_loss_limit": 0.05
+        },
+        "strategy": {
+            "fast_window": 20,
+            "slow_window": 50,
+            "use_atr": True,
+            "atr_window": 14,
+            "fixed_size": None
+        }
+    }
+    cfg = Config(overrides=overrides)
+    setup_logging(cfg)
+    logger = logging.getLogger(__name__)
 
-    parser = argparse.ArgumentParser(description="Run trading system backtest (local test harness).")
-    parser.add_argument("--data-csv", type=str, help="CSV file with columns: datetime,open,high,low,close,volume", required=False)
-    parser.add_argument("--config", type=str, help="JSON config file to override defaults", required=False)
-    args = parser.parse_args()
+    logger.info("Generating synthetic data...")
+    data = generate_synthetic_data(start="2020-01-01", periods=800)
+    logger.info("Data generated with %d bars", len(data))
 
-    cfg = load_config(args.config)
-    logger = setup_logging(cfg.get("logging", {}))
-    ts = TradingSystem(cfg)
+    backtester = Backtester(data, cfg=cfg)
+    results = backtester.run()
 
-    # If a CSV was supplied attempt to load it
-    if args.data_csv:
-        try:
-            df = pd.read_csv(args.data_csv, parse_dates=['datetime'], index_col='datetime')
-            # Ensure required columns exist
-            for col in ['open', 'high', 'low', 'close']:
-                if col not in df.columns:
-                    raise ValueError(f"CSV missing required column: {col}")
-            result = ts.run_backtest(df[['open', 'high', 'low', 'close']])
-            perf = result['performance']
-            logger.info("Finished. Total return %.2f%%, CAGR %.2f%%, MaxDD %.2f%%, Sharpe %.2f",
-                        perf['total_return'] * 100, perf['cagr'] * 100, perf['max_drawdown'] * 100,
-                        perf['sharpe'] if not np.isnan(perf['sharpe']) else -999)
-            # Save trades log to csv for analysis
-            trades_out = []
-            for t in result['trades']:
-                trades_out.append({
-                    'entry_date': t.entry_date,
-                    'exit_date': t.exit_date,
-                    'entry_price': t.entry_price,
-                    'exit_price': t.exit_price,
-                    'size': t.size,
-                    'direction': t.direction,
-                    'pnl': t.pnl,
-                    'holding_bars': t.holding_bars
-                })
-            if trades_out:
-                trades_df = pd.DataFrame(trades_out)
-                trades_df.to_csv("trades_log.csv", index=False)
-                logger.info("Saved trades log to trades_log.csv")
-        except Exception as e:
-            logger.exception("Failed to run backtest: %s", e)
-    else:
-        logger.info("No data CSV provided. Example run skipped.")
-        logger.info("To run backtest: python trading_system.py --data-csv YOUR_DATA.csv --config config.json")
+    # Print summary
+    metrics = results["metrics"]
+    logger.info("Final Results:")
+    logger.info("Total Return: %.2f%%", metrics["total_return"] * 100)
+    logger.info("CAGR: %.2f%%", metrics["cagr"] * 100)
+    logger.info("Sharpe: %.3f", metrics["sharpe"])
+    logger.info("Max Drawdown: %.2f%%", metrics["max_drawdown"] * 100)
+
+    trades = results["trades"]
+    logger.info("Total Trades: %d", len(trades))
+    for t in trades[:50]:
+        logger.info("%s %s %d @ %.4f (commission=%.2f) at %s", t.side, t.symbol, t.quantity, t.price, t.commission, t.timestamp)
+
+    # Optionally, you could save equity curve and trades to CSV for further analysis
+    try:
+        eq = results["equity_curve"]
+        eq.to_csv("equity_curve.csv")
+        trades_df = pd.DataFrame([t.__dict__ for t in trades])
+        trades_df.to_csv("trades.csv", index=False)
+        logger.info("Saved equity_curve.csv and trades.csv")
+    except Exception:
+        logger.exception("Error saving output files")
