@@ -1,128 +1,187 @@
 {
+  "schemaVersion": "v1",
   "projectName": "auto-trading-system",
-  "language": "python",
-  "pythonVersion": "3.11",
-  "packageManager": "poetry",
-  "entrypoint": "src/main.py",
-  "folders": {
+  "description": "Claude Code workspace settings for Python-based automated trading system development (simulation-first, safe-by-default).",
+  "environment": {
+    "language": "python",
+    "pythonVersion": "3.11",
+    "venvTool": "venv",
+    "container": {
+      "useDocker": true,
+      "dockerfilePath": "Dockerfile"
+    },
+    "sandboxed": true
+  },
+  "layout": {
+    "src": "src",
+    "packageName": "ats",
     "docs": "docs",
-    "source": "src",
-    "tests": "tests",
-    "design": "design",
-    "decisions": "decisions",
+    "designDocs": "docs/design",
+    "decisionLogs": "docs/decisions",
     "skills": "skills",
-    "configs": "configs"
+    "tests": "tests",
+    "configs": "config",
+    "cliEntry": "src/main.py",
+    "examples": "examples"
   },
-  "priorityFiles": [
-    "design/**",
-    "decisions/**",
-    "skills/**",
-    "docs/**",
-    "src/**",
-    "tests/**",
-    "README.md"
-  ],
-  "tooling": {
-    "formatter": "black",
-    "linters": [
-      "flake8",
-      "ruff"
+  "dependencies": {
+    "runtime": [
+      "numpy",
+      "pandas",
+      "pydantic",
+      "requests",
+      "httpx",
+      "ccxt"
     ],
-    "typeChecker": "mypy",
-    "testRunner": "pytest",
-    "docTool": "mkdocs",
-    "preCommit": "pre-commit",
-    "securityScanner": "bandit"
+    "dev": [
+      "pytest",
+      "pytest-cov",
+      "black",
+      "ruff",
+      "isort",
+      "mypy",
+      "sphinx",
+      "mkdocs",
+      "pre-commit",
+      "loguru",
+      "pyyaml"
+    ],
+    "pinningStrategy": "constraints.txt or poetry-lock recommended"
   },
-  "dependencies": [
-    "pandas",
-    "numpy",
-    "pydantic",
-    "requests",
-    "aiohttp",
-    "ccxt"
-  ],
-  "devDependencies": [
-    "pytest",
-    "pytest-cov",
-    "black",
-    "flake8",
-    "ruff",
-    "mypy",
-    "pre-commit",
-    "bandit",
-    "mkdocs"
-  ],
-  "commands": {
-    "test": "pytest --maxfail=1 -q",
-    "lint": "ruff check src tests && flake8 src tests",
-    "format": "black src tests docs",
-    "typecheck": "mypy src",
-    "docsBuild": "mkdocs build --clean"
+  "tools": {
+    "formatter": {
+      "name": "black",
+      "lineLength": 88
+    },
+    "linter": {
+      "name": "ruff",
+      "configPath": "pyproject.toml"
+    },
+    "typeChecker": {
+      "name": "mypy",
+      "configPath": "mypy.ini"
+    },
+    "importSorter": {
+      "name": "isort",
+      "configPath": "pyproject.toml"
+    },
+    "testRunner": {
+      "name": "pytest",
+      "coverage": true,
+      "coverageConfig": ".coveragerc"
+    },
+    "docs": {
+      "generator": "mkdocs",
+      "configPath": "mkdocs.yml",
+      "buildCommand": "mkdocs build"
+    }
   },
   "ci": {
     "enabled": true,
-    "workflowName": "ci-python.yml",
-    "runsOn": "ubuntu-latest",
-    "steps": [
-      "setup-python",
-      "install-deps",
-      "run-lint",
-      "run-typecheck",
-      "run-tests",
+    "provider": "github_actions",
+    "workflowPath": ".github/workflows/ci.yml",
+    "checks": [
+      "install",
+      "lint",
+      "format-check",
+      "type-check",
+      "test",
       "build-docs"
-    ]
-  },
-  "repositoryLayout": {
-    "docs": {
-      "primary": "docs",
-      "generator": "mkdocs"
-    },
-    "source": {
-      "packageRoot": "src",
-      "testsRoot": "tests"
-    },
-    "design": {
-      "architecture": "design/architecture.md",
-      "requirements": "design/requirements.md"
-    },
-    "decisions": {
-      "decisionLog": "decisions/decision-log.md"
-    },
-    "skills": {
-      "location": "skills",
-      "pattern": "*.skill.md"
+    ],
+    "policy": {
+      "requirePassingChecksBeforeMerge": true,
+      "requirePRReview": true,
+      "defaultBranch": "main"
     }
   },
+  "developmentPreferences": {
+    "prioritizeFiles": [
+      "docs/design/**",
+      "docs/decisions/**",
+      "skills/**",
+      "src/**",
+      "tests/**"
+    ],
+    "decisionLogsPath": "docs/decisions/decision_log.md",
+    "skillsPath": "skills",
+    "designDocsPath": "docs/design",
+    "preferSimulationOverLive": true,
+    "defaultSecretsPolicy": "use_dummy_or_env_vars; never commit real keys"
+  },
   "safety": {
-    "networkAccess": {
-      "allowedByDefault": false,
-      "requireExplicitApprovalForExternalConnections": true
+    "liveTrading": {
+      "enabledByDefault": false,
+      "requireManualEnable": true,
+      "manualEnableProcedure": "explicit documented approval in decision logs and two-person approval",
+      "safeguards": [
+        "use_sandbox_or_paper_trading_accounts",
+        "backtest_and_simulate_before_any_live_execution",
+        "code_review_and_approval_required",
+        "secrets_must_be_stored_in_vault_and_not_in_repo"
+      ]
     },
-    "secretsHandling": {
-      "secretsFiles": [
-        ".env",
-        "configs/secrets.yaml",
-        "configs/secrets.json"
-      ],
-      "ignoreInVcs": true
-    },
-    "tradingExecution": {
-      "requireCredentialsAndApproval": true,
-      "no-unsafe-actions-by-default": true
-    },
-    "reviewPriorities": [
-      "design",
-      "decisions",
-      "skills"
+    "prohibitedCapabilities": [
+      "execute_unreviewed_live_trades",
+      "access_bank_accounts_or_move_funds",
+      "exfiltrate_sensitive_data",
+      "bypass_security_controls",
+      "assist_with_illicit_or_harmful_activities"
+    ],
+    "allowedCapabilities": [
+      "analysis",
+      "code_generation",
+      "unit_test_generation",
+      "integration_test_generation",
+      "documentation_generation",
+      "simulation_and_backtesting_scenarios",
+      "static_security_analysis"
     ]
   },
-  "filesToIgnore": [
-    ".env",
-    "configs/secrets.yaml",
-    "configs/secrets.json",
-    ".venv",
-    "__pycache__",
-    "*.pyc"
+  "testingAndSimulation": {
+    "simulateOnlyByDefault": true,
+    "marketDataReplay": {
+      "enabled": true,
+      "path": "tests/fixtures/market_data"
+    },
+    "useDummyKeysForTests": true,
+    "testCoverageRequirementPercent": 80
+  },
+  "repository": {
+    "requiredFiles": [
+      "README.md",
+      "LICENSE",
+      "pyproject.toml",
+      "requirements.txt or poetry.lock",
+      ".claude/settings.json"
+    ],
+    "git": {
+      "defaultBranch": "main",
+      "protectMain": true,
+      "requirePRReview": true
+    }
+  },
+  "loggingAndObservability": {
+    "defaultLogger": "loguru",
+    "logConfigPath": "config/logging.yaml",
+    "retainLogsFor": "90d"
+  },
+  "fileTemplates": {
+    "moduleTemplate": "src/{{module}}/__init__.py",
+    "testTemplate": "tests/test_{{module}}.py",
+    "skillTemplate": "skills/{{skill_name}}.py",
+    "decisionLogTemplate": "docs/decisions/decision_log.md"
+  },
+  "workspaceFiles": [
+    "README.md",
+    "docs/",
+    "docs/design/",
+    "docs/decisions/",
+    "src/",
+    "skills/",
+    "tests/",
+    ".github/workflows/ci.yml",
+    "Dockerfile",
+    "pyproject.toml",
+    ".claude/settings.json"
   ]
 }
