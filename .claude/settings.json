@@ -1,140 +1,128 @@
 {
-  "projectName": "自動売買システム",
-  "description": "自動売買システム開発向けClaude Codeプロジェクト設定。Python中心、docs/src/testsを重視。設計書・意思決定ログ・スキルファイルを優先参照。ライブ取引自動実行は禁止。",
+  "projectName": "auto-trading-system",
   "language": "python",
-  "python": {
-    "version": "3.11",
-    "venv": ".venv",
-    "packageManager": "pip",
-    "dependencies": [
-      "numpy",
-      "pandas",
-      "pydantic",
-      "requests",
-      "aiohttp",
-      "ccxt",
-      "pytest",
-      "matplotlib"
-    ],
-    "devDependencies": [
-      "black",
-      "isort",
-      "ruff",
-      "mypy",
-      "pytest",
-      "pre-commit"
-    ],
-    "requirementsFile": "requirements.txt",
-    "devRequirementsFile": "requirements-dev.txt"
-  },
+  "pythonVersion": "3.11",
+  "packageManager": "poetry",
+  "entrypoint": "src/main.py",
   "folders": {
     "docs": "docs",
-    "src": "src",
+    "source": "src",
     "tests": "tests",
-    "skills": "skills",
     "design": "design",
-    "logs": "logs"
+    "decisions": "decisions",
+    "skills": "skills",
+    "configs": "configs"
   },
-  "entrypoint": "src/main.py",
-  "tests": {
-    "framework": "pytest",
-    "coverage": true,
-    "coverageConfig": {
-      "paths": [
-        "src"
-      ]
-    },
-    "testPattern": "tests/test_*.py"
+  "priorityFiles": [
+    "design/**",
+    "decisions/**",
+    "skills/**",
+    "docs/**",
+    "src/**",
+    "tests/**",
+    "README.md"
+  ],
+  "tooling": {
+    "formatter": "black",
+    "linters": [
+      "flake8",
+      "ruff"
+    ],
+    "typeChecker": "mypy",
+    "testRunner": "pytest",
+    "docTool": "mkdocs",
+    "preCommit": "pre-commit",
+    "securityScanner": "bandit"
   },
-  "docs": {
-    "tool": "mkdocs",
-    "config": "docs/mkdocs.yml",
-    "emphasis": [
-      "設計書",
-      "意思決定ログ",
-      "スキルファイル"
-    ]
+  "dependencies": [
+    "pandas",
+    "numpy",
+    "pydantic",
+    "requests",
+    "aiohttp",
+    "ccxt"
+  ],
+  "devDependencies": [
+    "pytest",
+    "pytest-cov",
+    "black",
+    "flake8",
+    "ruff",
+    "mypy",
+    "pre-commit",
+    "bandit",
+    "mkdocs"
+  ],
+  "commands": {
+    "test": "pytest --maxfail=1 -q",
+    "lint": "ruff check src tests && flake8 src tests",
+    "format": "black src tests docs",
+    "typecheck": "mypy src",
+    "docsBuild": "mkdocs build --clean"
   },
   "ci": {
     "enabled": true,
-    "workflowFile": ".github/workflows/ci.yml",
-    "commands": [
-      "python -m pip install --upgrade pip",
-      "pip install -r requirements-dev.txt",
-      "black --check .",
-      "ruff check .",
-      "mypy src || true",
-      "pytest --maxfail=1 --disable-warnings -q"
+    "workflowName": "ci-python.yml",
+    "runsOn": "ubuntu-latest",
+    "steps": [
+      "setup-python",
+      "install-deps",
+      "run-lint",
+      "run-typecheck",
+      "run-tests",
+      "build-docs"
     ]
   },
-  "formatting": {
-    "formatter": "black",
-    "lineLength": 88,
-    "isort": true,
-    "ruff": true
+  "repositoryLayout": {
+    "docs": {
+      "primary": "docs",
+      "generator": "mkdocs"
+    },
+    "source": {
+      "packageRoot": "src",
+      "testsRoot": "tests"
+    },
+    "design": {
+      "architecture": "design/architecture.md",
+      "requirements": "design/requirements.md"
+    },
+    "decisions": {
+      "decisionLog": "decisions/decision-log.md"
+    },
+    "skills": {
+      "location": "skills",
+      "pattern": "*.skill.md"
+    }
   },
-  "linting": {
-    "mypy": true,
-    "mypyStrict": false,
-    "ruff": true
-  },
-  "security": {
-    "allowNetwork": true,
-    "allowTradingExecution": false,
-    "allowedEnvironments": [
-      "backtest",
-      "paper",
-      "simulation"
-    ],
-    "forbiddenActions": [
-      "execute-live-orders",
-      "automated-fund-transfers",
-      "exfiltrate-credentials",
-      "modify-exchange-accounts"
-    ],
-    "credentialStorageRecommendations": "シークレットは環境変数または専用のシークレット管理を使用"
-  },
-  "priorities": {
-    "referenceOrder": [
+  "safety": {
+    "networkAccess": {
+      "allowedByDefault": false,
+      "requireExplicitApprovalForExternalConnections": true
+    },
+    "secretsHandling": {
+      "secretsFiles": [
+        ".env",
+        "configs/secrets.yaml",
+        "configs/secrets.json"
+      ],
+      "ignoreInVcs": true
+    },
+    "tradingExecution": {
+      "requireCredentialsAndApproval": true,
+      "no-unsafe-actions-by-default": true
+    },
+    "reviewPriorities": [
       "design",
-      "design/decisions.log",
-      "skills",
-      "src",
-      "docs",
-      "tests"
-    ],
-    "useDecisionLog": true,
-    "decisionLogPath": "design/decisions.log",
-    "skillFilesPath": "skills"
-  },
-  "templates": {
-    "moduleTemplate": "templates/module.py.tpl",
-    "testTemplate": "templates/test.py.tpl",
-    "docTemplate": "templates/doc.md.tpl"
-  },
-  "git": {
-    "gitignore": [
-      ".venv/",
-      "__pycache__/",
-      "*.pyc",
-      "*.pyo",
-      "*.pyd",
-      "*.log",
-      "data/",
-      "secrets.json",
-      ".env",
-      "build/",
-      "dist/"
+      "decisions",
+      "skills"
     ]
   },
-  "metadata": {
-    "createdBy": "ClaudeCodeArchitect",
-    "focus": "自動売買システム開発",
-    "emphasis": [
-      "docs",
-      "src",
-      "tests"
-    ],
-    "safetyNote": "この設定はライブ取引の自動実行を行わない前提です。実運用時は必ず手動レビューと運用ガードを追加してください。"
-  }
+  "filesToIgnore": [
+    ".env",
+    "configs/secrets.yaml",
+    "configs/secrets.json",
+    ".venv",
+    "__pycache__",
+    "*.pyc"
+  ]
 }
