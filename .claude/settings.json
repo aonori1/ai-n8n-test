@@ -1,177 +1,148 @@
 {
-  "projectName": "auto-trading-system",
-  "description": "Claude Code project settings for automated trading system development (Python-focused). Prioritizes docs, src, tests and safe development practices.",
-  "environment": {
-    "language": "python",
-    "pythonVersion": "3.11",
-    "packageManager": "poetry",
-    "virtualEnv": "venv",
-    "dependencyLock": true
+  "projectName": "auto-trade-system",
+  "claudeCodeVersion": "1.0",
+  "language": "python",
+  "pythonVersion": "3.11",
+  "packageManager": "poetry",
+  "venv": {
+    "create": true,
+    "type": "venv",
+    "activateOnOpen": true
   },
-  "layout": {
-    "src": "src",
-    "tests": "tests",
-    "docs": "docs",
-    "designs": "designs",
-    "decisionLogs": "docs/decision_logs",
-    "skills": "skills",
-    "artifacts": "dist",
-    "localData": "data"
+  "projectStructure": {
+    "srcDir": "src",
+    "testsDir": "tests",
+    "docsDir": "docs",
+    "designDocsDir": "design",
+    "decisionLogsDir": "decisions",
+    "skillsDir": "skills",
+    "configsDir": "config",
+    "scriptsDir": "scripts"
   },
-  "priorities": [
-    "designs",
-    "docs/decision_logs",
-    "skills",
-    "src",
-    "tests"
+  "entryPoints": [
+    "src/main.py",
+    "src/app/__init__.py"
   ],
-  "devTools": {
-    "formatter": {
-      "primary": "black",
-      "options": ["--line-length=88"]
-    },
-    "importSorter": "isort",
-    "linters": ["flake8", "mypy"],
-    "typeChecking": true,
-    "testRunner": "pytest",
-    "testCommand": "pytest -q --maxfail=1",
-    "coverage": {
-      "enabled": true,
-      "command": "pytest --cov=src --cov-report=xml"
-    },
-    "preCommit": [
-      "black",
-      "isort",
-      "flake8",
-      "mypy",
-      "pytest"
-    ]
+  "filesToPrioritize": [
+    "design/*.md",
+    "decisions/*.md",
+    "skills/*.yaml",
+    "docs/**",
+    "README.md"
+  ],
+  "developmentFocus": {
+    "prioritize": [
+      "docs",
+      "src",
+      "tests"
+    ],
+    "docsTool": "mkdocs",
+    "docsConfigFile": "mkdocs.yml"
   },
-  "documentation": {
-    "tool": "sphinx",
-    "docsSource": "docs",
-    "buildCommand": "sphinx-build -b html docs docs/_build/html",
-    "serveCommand": "sphinx-autobuild docs docs/_build/html --open-browser",
-    "requireDesignReference": true
+  "linting": {
+    "tools": [
+      "ruff",
+      "flake8"
+    ],
+    "configFiles": [
+      "pyproject.toml",
+      ".flake8"
+    ],
+    "runOnSave": true
+  },
+  "formatting": {
+    "tool": "black",
+    "lineLength": 88,
+    "runOnSave": true
+  },
+  "typeChecking": {
+    "tool": "mypy",
+    "configFile": "mypy.ini",
+    "strict": true
+  },
+  "testing": {
+    "framework": "pytest",
+    "coverageTool": "coverage",
+    "minCoveragePercent": 80,
+    "testDiscoveryPattern": "tests/**/test_*.py",
+    "runOnCI": true
   },
   "ci": {
-    "provider": "github_actions",
-    "workflows": {
-      "lint_and_test": {
-        "runs-on": "ubuntu-latest",
-        "steps": [
-          "checkout",
-          "setup-python 3.11",
-          "install dependencies (poetry install)",
-          "run linters",
-          "run tests"
-        ]
-      },
-      "build_docs": {
-        "runs-on": "ubuntu-latest",
-        "steps": [
-          "checkout",
-          "setup-python 3.11",
-          "install dependencies",
-          "build docs"
-        ]
+    "provider": "github-actions",
+    "workflows": [
+      {
+        "name": "python-ci",
+        "file": ".github/workflows/python-ci.yml"
       }
-    },
-    "requirePassingChecksBeforeMerge": true
-  },
-  "safety": {
-    "riskProfile": "conservative",
-    "networkPolicy": {
-      "mode": "restricted",
-      "allowedHosts": [
-        "127.0.0.1",
-        "localhost"
-      ],
-      "note": "Outbound network to live broker endpoints is disallowed by default"
-    },
-    "liveTrading": {
-      "requireExplicitEnable": true,
-      "envVar": "ALLOW_LIVE_TRADING",
-      "default": false,
-      "approvalArtifact": "designs/live_trading_approval.md",
-      "approvalRequiredFrom": ["architect", "lead_developer"]
-    },
-    "simulationMode": {
-      "envVar": "SIMULATION_MODE",
-      "requiredForRun": true,
-      "default": true
-    },
-    "secretsPolicy": {
-      "storeSecretsOutsideRepo": true,
-      "recommendedStorage": ["environment", "vault"],
-      "disallowedInRepo": ["BROKER_API_KEY", "BROKER_SECRET", "PRIVATE_KEYS"]
-    },
-    "executionControls": {
-      "disallowArbitraryRemoteCommands": true,
-      "requireDesignReferenceBeforeRiskyChange": true
-    }
-  },
-  "files": {
-    "include": [
-      "src/**",
-      "docs/**",
-      "tests/**",
-      "designs/**",
-      "skills/**",
-      ".claude/**"
-    ],
-    "exclude": [
-      "data/**",
-      "secrets/**",
-      "dist/**",
-      ".venv/**"
-    ],
-    "importantFiles": {
-      "designDocuments": "designs/README.md",
-      "decisionLog": "docs/decision_logs/decisions.md",
-      "skillsIndex": "skills/README.md"
-    }
-  },
-  "commands": {
-    "setup": "poetry install",
-    "activateEnv": "source venv/bin/activate || poetry shell",
-    "lint": "flake8 src tests && mypy src",
-    "format": "black src tests docs && isort src tests",
-    "test": "pytest -q",
-    "coverage": "pytest --cov=src --cov-report=term-missing",
-    "buildDocs": "sphinx-build -b html docs docs/_build/html"
-  },
-  "secrets": {
-    "handledSecurely": true,
-    "envRestricted": [
-      "BROKER_API_KEY",
-      "BROKER_SECRET",
-      "VAULT_TOKEN"
-    ],
-    "neverCommitRule": true
-  },
-  "loggingAndTracing": {
-    "decisionLogPath": "docs/decision_logs/decisions.md",
-    "designDocPath": "designs/README.md",
-    "changeLogPath": "docs/changelog.md",
-    "recordDecisionOnRiskyChange": true
-  },
-  "editor": {
-    "formatOnSave": true,
-    "recommendedExtensions": [
-      "ms-python.python",
-      "ms-python.vscode-pylance",
-      "eamodio.gitlens",
-      "njpwerner.autodocstring"
     ]
   },
-  "metadata": {
-    "createdBy": "system-architect",
-    "intendedUse": "development of automated trading system with emphasis on safety, docs, tests",
-    "referencePriority": [
-      "designs",
-      "docs/decision_logs",
+  "packaging": {
+    "build": "poetry build",
+    "artifact": "wheel"
+  },
+  "dependencies": {
+    "production": [
+      "pandas",
+      "numpy",
+      "pyyaml",
+      "requests"
+    ],
+    "development": [
+      "pytest",
+      "coverage",
+      "pytest-cov",
+      "black",
+      "ruff",
+      "mypy",
+      "mkdocs",
+      "bandit"
+    ]
+  },
+  "security": {
+    "scanTools": [
+      "bandit"
+    ],
+    "secretScanning": true,
+    "forbiddenActions": [
+      "execute_market_orders_in_development",
+      "use_real_api_keys_in_repo",
+      "exfiltrate_secrets",
+      "auto_deploy_without_manual_review"
+    ],
+    "forbiddenDependencies": [
+      "fabric",
+      "paramiko"
+    ],
+    "networkAccessPolicy": {
+      "allowExternalRequestsDuringTests": false,
+      "requireMockingForExternalApis": true
+    }
+  },
+  "safetyConstraints": {
+    "no_live_trading_by_default": true,
+    "require_manual_approval_for_real_trading": true,
+    "decisionLogRequiredForRiskyChanges": true,
+    "designDocRequiredForArchitectureChanges": true
+  },
+  "developmentGuidelines": {
+    "docsFirst": true,
+    "designAndDecisionPriority": [
+      "design",
+      "decisions",
       "skills"
-    ]
+    ],
+    "commitMessageConvention": "Conventional Commits",
+    "codeReviewRequired": true,
+    "testsRequiredForPR": true
+  },
+  "workflowHints": {
+    "localSetupCommands": [
+      "python -m venv .venv",
+      "source .venv/bin/activate",
+      "poetry install"
+    ],
+    "runTestsCommand": "pytest --cov=src",
+    "lintCommand": "ruff check src tests && black --check .",
+    "formatCommand": "black ."
   }
 }
