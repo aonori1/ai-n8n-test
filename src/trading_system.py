@@ -1,384 +1,384 @@
-import os
+import copy
 import logging
-import configparser
-from datetime import timedelta
+import math
+from dataclasses import dataclass
+from typing import Dict, Optional
+
 import numpy as np
 import pandas as pd
 
-# -----------------------------------------------------------------------------
-# Trading system
-# - Architecture is class-based to remain consistent with typical designs.
-# - Preserves logging and configuration loading.
-# - Adds volatility-based position sizing (ATR), fixed maximum exposure,
-#   per-trade risk limit, stop-loss, trailing stop, and max-drawdown protection.
-# - Adds trend filter (EMA) to reduce whipsaws and lower drawdowns.
-# - Returns detailed backtest metrics including drawdown, CAGR, Sharpe, Sortino.
-# -----------------------------------------------------------------------------
-
-# ----------------------------
-# Configuration (preserve pattern)
-# ----------------------------
-DEFAULT_CONFIG = {
-    'backtest': {
-        'initial_cash': '100000.0',
-        'commission_per_trade': '1.0',
-        'slippage_per_trade': '0.0',
-        'max_exposure_pct': '0.20',     # max fraction of portfolio in any single instrument
-        'daily_max_loss_pct': '0.05',   # if daily loss exceeds this, stop trading rest of day
-        'global_max_drawdown_pct': '0.25', # if portfolio drawdown exceeds, stop/backoff
-    },
-    'strategy': {
-        'ema_short': '20',
-        'ema_long': '50',
-        'atr_period': '14',
-        'atr_risk_pct': '0.01',  # risk per trade as fraction of equity (1%)
-        'min_atr_multiplier': '0.5',  # prevents oversized positions if ATR tiny
-        'stop_atr_multiplier': '3.0',  # stop-loss distance in ATRs
-        'trailing_stop_atr': '2.0',   # trailing stop distance in ATRs after in profit
-        'signal_threshold': '0.0',    # additional threshold for signals (can tune)
-        'volatility_scaling_target_vol': '0.10',  # target portfolio vol (10% annual) for vol scaling
-        'max_positions': '5',
-    },
-    'logging': {
-        'level': 'INFO',
-        'log_file': 'trading_system.log'
-    }
+# -------------------------
+# Configuration (preserve)
+# -------------------------
+CONFIG: Dict = {
+    "initial_capital": 1_000_000,
+    "risk_per_trade": 0.005,  # fraction of equity to risk per trade (0.5%)
+    "atr_period": 14,
+    "stop_atr_multiplier": 3.0,  # initial stop distance in ATRs
+    "trail_atr_multiplier": 2.0,  # trailing stop distance in ATRs
+    "vol_target_annual": 0.10,  # target portfolio volatility (10% annual)
+    "vol_lookback_days": 21,
+    "max_drawdown": 0.20,  # stop trading / de-risk if drawdown exceeds 20%
+    "drawdown_scale_start": 0.05,  # begin scaling risk after 5% drawdown
+    "max_leverage": 3.0,
+    "trend_fast": 50,
+    "trend_slow": 200,
+    "min_holding_days": 2,
+    "trade_cost": 0.0005,  # fraction (0.05%)
+    "slippage": 0.0005,
+    "verbose_logging": True,
+    "seed": 42,
 }
 
-def load_config(path='config.ini'):
-    config = configparser.ConfigParser()
-    config.read_dict(DEFAULT_CONFIG)
-    if os.path.exists(path):
-        config.read(path)
-    return config
-
-# ----------------------------
+# -------------------------
 # Logging (preserve)
-# ----------------------------
-def setup_logging(config):
-    level_name = config.get('logging', 'level', fallback='INFO')
-    level = getattr(logging, level_name.upper(), logging.INFO)
-    log_file = config.get('logging', 'log_file', fallback='trading_system.log')
-
-    logging.basicConfig(
-        level=level,
-        format='%(asctime)s %(levelname)s %(message)s',
-        handlers=[
-            logging.FileHandler(log_file),
-            logging.StreamHandler()
-        ]
-    )
-    logging.info("Logging initialized at level %s", level_name)
+# -------------------------
+logger = logging.getLogger("trading_system")
+logger.setLevel(logging.DEBUG if CONFIG["verbose_logging"] else logging.INFO)
+if not logger.handlers:
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.DEBUG if CONFIG["verbose_logging"] else logging.INFO)
+    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+    ch.setFormatter(formatter)
+    logger.addHandler(ch)
 
 
-# ----------------------------
-# Indicators and utilities
-# ----------------------------
-def ema(series, period):
-    return series.ewm(span=period, adjust=False).mean()
-
-def atr(df, period=14):
-    # True Range based on daily OHLC DataFrame with columns: ['open','high','low','close']
-    high = df['high']
-    low = df['low']
-    close = df['close']
+# -------------------------
+# Utilities
+# -------------------------
+def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int) -> pd.Series:
     tr1 = high - low
-    tr2 = (high - close.shift(1)).abs()
-    tr3 = (low - close.shift(1)).abs()
+    tr2 = (high - close.shift()).abs()
+    tr3 = (low - close.shift()).abs()
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    atr_series = tr.rolling(window=period, min_periods=1).mean()
-    return atr_series
+    return tr.rolling(window=period, min_periods=1).mean()
 
-def calculate_drawdowns(equity_series):
-    peak = equity_series.cummax()
-    drawdown = (equity_series - peak) / peak
-    max_drawdown = drawdown.min()
-    return drawdown, max_drawdown
 
-def sharpe_ratio(returns, rf=0.0, periods_per_year=252.0):
-    if returns.std() == 0:
+def rolling_volatility(returns: pd.Series, lookback: int) -> pd.Series:
+    # annualized volatility
+    return returns.rolling(window=lookback, min_periods=1).std() * np.sqrt(252)
+
+
+def max_drawdown(equity: pd.Series) -> float:
+    roll_max = equity.cummax()
+    drawdown = (equity - roll_max) / roll_max
+    return drawdown.min()
+
+
+def annualized_return(returns: pd.Series) -> float:
+    total_return = (1 + returns).prod() - 1
+    days = returns.shape[0]
+    if days <= 0:
         return 0.0
-    ann_return = returns.mean() * periods_per_year
-    ann_vol = returns.std() * np.sqrt(periods_per_year)
-    return (ann_return - rf) / ann_vol if ann_vol != 0 else 0.0
+    return (1 + total_return) ** (252.0 / days) - 1
 
-def sortino_ratio(returns, rf=0.0, periods_per_year=252.0):
-    downside = returns.copy()
-    downside[downside > 0] = 0
-    downside_std = np.sqrt((downside ** 2).sum() / max(1, len(downside) - 1))
-    ann_return = returns.mean() * periods_per_year
-    down_vol = downside_std * np.sqrt(periods_per_year)
-    return (ann_return - rf) / down_vol if down_vol != 0 else np.nan
 
-# ----------------------------
-# Trading System
-# ----------------------------
+def annualized_vol(returns: pd.Series) -> float:
+    return returns.std() * np.sqrt(252)
+
+
+def sharpe_ratio(returns: pd.Series, risk_free_rate: float = 0.0) -> float:
+    vol = annualized_vol(returns)
+    if vol == 0:
+        return 0.0
+    return (annualized_return(returns) - risk_free_rate) / vol
+
+
+# -------------------------
+# Strategy
+# -------------------------
+@dataclass
+class Position:
+    size: float = 0.0  # positive for long
+    entry_price: float = 0.0
+    stop_price: float = 0.0
+    entry_date: pd.Timestamp = None
+
+
 class TradingSystem:
-    def __init__(self, price_df, config=None):
-        """
-        price_df: DataFrame with index = date, columns = ['open','high','low','close']
-        config: configparser.ConfigParser or None to use defaults
-        """
-        self.config = config if config is not None else load_config()
-        setup_logging(self.config)
-        self.price = price_df.copy().sort_index()
-        self._load_parameters()
-        self._compute_indicators()
-        # Backtest state
-        self.cash = self.initial_cash
-        self.equity = self.initial_cash
-        self.position = 0.0    # number of shares (or contract equivalents), allow floats for sizing
-        self.position_entry_price = None
-        self.position_entry_atr = None
-        self.trail_stop_price = None
-        self.portfolio_history = []  # list of dicts per bar for analysis
-        self.daily_loss = 0.0
-        self.current_date = None
-        self.max_equity = self.equity
-        self.stop_trading_until = None  # date until which trading suspended after large loss
+    def __init__(self, config: Dict, logger: logging.Logger):
+        self.config = copy.deepcopy(config)
+        self.logger = logger
+        self.reset()
 
-    def _load_parameters(self):
-        b = self.config['backtest']
-        s = self.config['strategy']
-        self.initial_cash = float(b.get('initial_cash', DEFAULT_CONFIG['backtest']['initial_cash']))
-        self.commission = float(b.get('commission_per_trade', DEFAULT_CONFIG['backtest']['commission_per_trade']))
-        self.slippage = float(b.get('slippage_per_trade', DEFAULT_CONFIG['backtest']['slippage_per_trade']))
-        self.max_exposure_pct = float(b.get('max_exposure_pct', DEFAULT_CONFIG['backtest']['max_exposure_pct']))
-        self.daily_max_loss_pct = float(b.get('daily_max_loss_pct', DEFAULT_CONFIG['backtest']['daily_max_loss_pct']))
-        self.global_max_drawdown_pct = float(b.get('global_max_drawdown_pct', DEFAULT_CONFIG['backtest']['global_max_drawdown_pct']))
+    def reset(self):
+        self.equity = self.config["initial_capital"]
+        self.initial_equity = self.equity
+        self.position = Position()
+        self.history = []
+        self.peak_equity = self.equity
+        self.max_drawdown_seen = 0.0
+        self.last_entry_index: Optional[int] = None
+        self.trading_disabled = False
 
-        self.ema_short = int(s.get('ema_short', DEFAULT_CONFIG['strategy']['ema_short']))
-        self.ema_long = int(s.get('ema_long', DEFAULT_CONFIG['strategy']['ema_long']))
-        self.atr_period = int(s.get('atr_period', DEFAULT_CONFIG['strategy']['atr_period']))
-        self.atr_risk_pct = float(s.get('atr_risk_pct', DEFAULT_CONFIG['strategy']['atr_risk_pct']))
-        self.min_atr_multiplier = float(s.get('min_atr_multiplier', DEFAULT_CONFIG['strategy']['min_atr_multiplier']))
-        self.stop_atr_multiplier = float(s.get('stop_atr_multiplier', DEFAULT_CONFIG['strategy']['stop_atr_multiplier']))
-        self.trailing_stop_atr = float(s.get('trailing_stop_atr', DEFAULT_CONFIG['strategy']['trailing_stop_atr']))
-        self.signal_threshold = float(s.get('signal_threshold', DEFAULT_CONFIG['strategy']['signal_threshold']))
-        self.vol_target = float(s.get('volatility_scaling_target_vol', DEFAULT_CONFIG['strategy']['volatility_scaling_target_vol']))
-        self.max_positions = int(s.get('max_positions', DEFAULT_CONFIG['strategy']['max_positions']))
+    def prepare_data(self, data: pd.DataFrame) -> pd.DataFrame:
+        df = data.copy().sort_index().copy()
+        # compute returns
+        df["close_prev"] = df["Close"].shift(1)
+        df["ret"] = df["Close"].pct_change().fillna(0.0)
+        # ATR
+        df["atr"] = atr(df["High"], df["Low"], df["Close"], self.config["atr_period"]).fillna(method="bfill")
+        # trend filters
+        df["sma_fast"] = df["Close"].rolling(window=self.config["trend_fast"], min_periods=1).mean()
+        df["sma_slow"] = df["Close"].rolling(window=self.config["trend_slow"], min_periods=1).mean()
+        # rolling vol
+        df["vol"] = rolling_volatility(df["ret"], self.config["vol_lookback_days"]).replace(0, 1e-9)
+        # momentum (5-day return)
+        df["mom5"] = df["Close"].pct_change(5)
+        return df
 
-    def _compute_indicators(self):
-        logging.info("Computing indicators: EMA(%d/%d), ATR(%d)", self.ema_short, self.ema_long, self.atr_period)
-        self.price['ema_short'] = ema(self.price['close'], self.ema_short)
-        self.price['ema_long'] = ema(self.price['close'], self.ema_long)
-        self.price['atr'] = atr(self.price, self.atr_period)
-        # Momentum/strength filter: slope of long EMA (percent over period)
-        self.price['ema_long_slope'] = self.price['ema_long'].pct_change(self.ema_long).fillna(0)
-
-    def _signal(self, idx):
-        """
-        Signal: 1 = go long, 0 = flat/exit
-        Use EMA crossover + trend filter + thresholding to reduce whipsaws.
-        """
-        row = self.price.iloc[idx]
-        if np.isnan(row['ema_short']) or np.isnan(row['ema_long']):
-            return 0
-        # Basic crossover
-        prev = self.price.iloc[max(0, idx-1)]
-        cross_up = (prev['ema_short'] <= prev['ema_long']) and (row['ema_short'] > row['ema_long'] + self.signal_threshold)
-        cross_down = (prev['ema_short'] >= prev['ema_long']) and (row['ema_short'] < row['ema_long'] - self.signal_threshold)
-        # Trend strength filter: require long-term EMA slope non-negative for long entries
-        trend_ok = row['ema_long_slope'] >= -0.0005  # allow tiny negative; tuneable
-        if cross_up and trend_ok:
-            return 1
-        elif cross_down:
-            return -1
-        return 0
-
-    def _size_position(self, price, atr):
-        """
-        Volatility-based position sizing using ATR:
-        - Risk per trade = ATR * stop_atr_multiplier * position_size_in_shares
-        - We want risk per trade in cash = equity * atr_risk_pct
-        - -> position_size = (equity * atr_risk_pct) / (atr * stop_atr_multiplier)
-        Enforce max exposure limit.
-        """
-        if atr <= 0 or np.isnan(atr):
+    def compute_dynamic_risk_scale(self, current_equity: float) -> float:
+        drawdown = max(0.0, (self.peak_equity - current_equity) / max(self.peak_equity, 1e-9))
+        self.max_drawdown_seen = max(self.max_drawdown_seen, drawdown)
+        if drawdown <= self.config["drawdown_scale_start"]:
+            return 1.0
+        # linear scaling from 1 -> 0.1 as drawdown goes from drawdown_scale_start -> max_drawdown
+        start = self.config["drawdown_scale_start"]
+        end = self.config["max_drawdown"]
+        if drawdown >= end:
             return 0.0
-        risk_amount = self.equity * self.atr_risk_pct
-        stop_distance = max(atr * self.stop_atr_multiplier, atr * self.min_atr_multiplier)
-        # shares (or contracts) to risk approx risk_amount per trade
-        size = risk_amount / stop_distance if stop_distance > 0 else 0
-        # limit by max exposure (% of equity)
-        max_position_value = self.equity * self.max_exposure_pct
-        max_size_by_value = max_position_value / price if price > 0 else 0
-        final_size = min(size, max_size_by_value)
-        return max(0.0, final_size)
+        scale = 1.0 - (drawdown - start) / max(end - start, 1e-9)
+        return max(0.1, scale)
 
-    def _apply_commission_slippage(self, cash):
-        # naive handling: subtract commission and slippage when trade executed
-        return cash - self.commission - self.slippage
+    def compute_position_size(self, equity: float, price: float, atr: float, vol: float, dynamic_scale: float) -> float:
+        # Method combines volatility targeting and per-trade risk
+        # compute notional to target vol: notional = equity * vol_target / current_vol
+        target_vol = self.config["vol_target_annual"]
+        notional_by_vol = equity * (target_vol / max(vol, 1e-9))
+        # compute risk-per-trade based on ATR stop distance
+        stop_distance = atr * self.config["stop_atr_multiplier"]
+        if stop_distance <= 0:
+            return 0.0
+        risk_amount = equity * self.config["risk_per_trade"] * dynamic_scale
+        size_by_risk = risk_amount / (stop_distance)
+        # approximate size by shares = min(notional, size_by_risk_in_shares)
+        size_by_notional = notional_by_vol / price
+        chosen_size = min(size_by_notional, size_by_risk)
+        # cap by leverage
+        max_shares_by_leverage = (equity * self.config["max_leverage"]) / price
+        chosen_size = max(0.0, min(chosen_size, max_shares_by_leverage))
+        return math.floor(chosen_size)
 
-    def run_backtest(self):
-        logging.info("Starting backtest from %s to %s", self.price.index.min(), self.price.index.max())
-        prev_day = None
-        for idx in range(len(self.price)):
-            row = self.price.iloc[idx]
-            date = row.name
-            self.current_date = date
+    def run_backtest(self, raw_data: pd.DataFrame) -> Dict:
+        df = self.prepare_data(raw_data)
+        # iterate over DataFrame rows
+        equity_curve = []
+        returns = []
+        position_value = 0.0
 
-            # Reset daily loss tracking at new day
-            if prev_day is None or date.date() != prev_day:
-                self.daily_loss = 0.0
-                prev_day = date.date()
+        for i, row in enumerate(df.itertuples()):
+            date = getattr(row, IndexName(df))
+            close = row.Close
+            high = row.High
+            low = row.Low
+            atr_val = row.atr
+            vol = row.vol
+            sma_fast = row.sma_fast
+            sma_slow = row.sma_slow
+            mom5 = row.mom5
 
-            # If suspended due to big drawdown, respect stop_trading_until
-            if self.stop_trading_until is not None and date <= self.stop_trading_until:
-                # no trading; just update equity history
-                self._record_history(date, row['close'], 'suspended')
-                self._update_max_equity()
-                continue
-            elif self.stop_trading_until is not None and date > self.stop_trading_until:
-                logging.info("Resuming trading on %s after suspension", date)
-                self.stop_trading_until = None
+            # Update peak equity and drawdown
+            equity_curve.append(self.equity)
+            self.peak_equity = max(self.peak_equity, self.equity)
+            current_drawdown = (self.peak_equity - self.equity) / max(self.peak_equity, 1e-9)
+            if current_drawdown >= self.config["max_drawdown"]:
+                if not self.trading_disabled:
+                    self.trading_disabled = True
+                    self.logger.warning(
+                        f"{date} - Max drawdown exceeded ({current_drawdown:.2%}). Disabling new entries and scaling down risk."
+                    )
 
-            signal = self._signal(idx)
-            price = row['close']
-            atr_val = row['atr'] if 'atr' in row.index else np.nan
+            # Check exit conditions first (stop loss, trend reversal, time)
+            pnl = 0.0
+            if self.position.size > 0:
+                # update trailing stop
+                trailing_stop = max(self.position.stop_price, close - atr_val * self.config["trail_atr_multiplier"])
+                if trailing_stop > self.position.stop_price:
+                    self.logger.debug(f"{date} - Updating trailing stop from {self.position.stop_price:.4f} to {trailing_stop:.4f}")
+                    self.position.stop_price = trailing_stop
 
-            # Position management: entry, exit, stops, trailing stop
-            if self.position == 0.0:
-                # consider entry
-                if signal == 1:
-                    size = self._size_position(price, atr_val)
-                    if size > 0 and self._can_open_new_position():
-                        # open long
-                        cost = size * price
-                        cost_with_fees = cost + self.commission + self.slippage
-                        if cost_with_fees <= self.cash:
-                            self.position = size
-                            self.position_entry_price = price
-                            self.position_entry_atr = atr_val
-                            # initial stop
-                            self.trail_stop_price = price - max(atr_val * self.stop_atr_multiplier, atr_val * self.min_atr_multiplier)
-                            self.cash -= cost_with_fees
-                            logging.debug("Enter long %s @ %.4f size=%.4f cash=%.2f", date, price, size, self.cash)
-                        else:
-                            logging.debug("Not enough cash to open size=%.4f at price=%.4f", size, price)
+                # Check stop hit (assume executed at close if close <= stop_price)
+                if close <= self.position.stop_price:
+                    exit_price = close * (1 - self.config["slippage"]) - self.config["trade_cost"] * close
+                    proceeds = self.position.size * exit_price
+                    entry_cost = self.position.size * self.position.entry_price
+                    pnl = proceeds - entry_cost
+                    # update equity
+                    self.equity += pnl
+                    self.logger.info(
+                        f"{date} - STOP EXIT: size={self.position.size}, entry={self.position.entry_price:.4f}, exit={exit_price:.4f}, pnl={pnl:.2f}, equity={self.equity:.2f}"
+                    )
+                    # record trade
+                    self.history.append(
+                        {
+                            "date": date,
+                            "action": "exit_stop",
+                            "size": self.position.size,
+                            "entry_price": self.position.entry_price,
+                            "exit_price": exit_price,
+                            "pnl": pnl,
+                            "equity": self.equity,
+                        }
+                    )
+                    self.position = Position()
+                    self.last_entry_index = None
+
+                # trend reversal exit: if price drops below sma_fast or sma_fast below sma_slow
+                elif close < sma_fast or sma_fast < sma_slow:
+                    # require minimum holding period
+                    holding_days = (date - (self.position.entry_date or date)).days if self.position.entry_date else 9999
+                    if holding_days >= self.config["min_holding_days"]:
+                        exit_price = close * (1 - self.config["slippage"]) - self.config["trade_cost"] * close
+                        proceeds = self.position.size * exit_price
+                        entry_cost = self.position.size * self.position.entry_price
+                        pnl = proceeds - entry_cost
+                        self.equity += pnl
+                        self.logger.info(
+                            f"{date} - TREND EXIT: size={self.position.size}, entry={self.position.entry_price:.4f}, exit={exit_price:.4f}, pnl={pnl:.2f}, equity={self.equity:.2f}"
+                        )
+                        self.history.append(
+                            {
+                                "date": date,
+                                "action": "exit_trend",
+                                "size": self.position.size,
+                                "entry_price": self.position.entry_price,
+                                "exit_price": exit_price,
+                                "pnl": pnl,
+                                "equity": self.equity,
+                            }
+                        )
+                        self.position = Position()
+                        self.last_entry_index = None
+
+            # Entry logic
+            enter_long = False
+            if self.position.size == 0 and not self.trading_disabled:
+                # Require: price > fast SMA and trend upward (fast > slow) and short momentum positive
+                if close > sma_fast and sma_fast > sma_slow and (mom5 is not None and mom5 > 0):
+                    enter_long = True
+
+            if enter_long:
+                dynamic_scale = self.compute_dynamic_risk_scale(self.equity)
+                if dynamic_scale <= 0:
+                    self.logger.warning(f"{date} - Dynamic scale is zero, skipping entry.")
+                else:
+                    size = self.compute_position_size(self.equity, close, atr_val, vol, dynamic_scale)
+                    if size >= 1:
+                        entry_price = close * (1 + self.config["slippage"]) + self.config["trade_cost"] * close
+                        stop_price = entry_price - atr_val * self.config["stop_atr_multiplier"]
+                        # Allocate
+                        cost = size * entry_price
+                        # Do not let position cost exceed max_leverage*equity
+                        if cost > self.equity * self.config["max_leverage"]:
+                            size = math.floor((self.equity * self.config["max_leverage"]) / entry_price)
+                        if size >= 1:
+                            self.position = Position(size, entry_price, stop_price, date)
+                            self.last_entry_index = i
+                            self.logger.info(
+                                f"{date} - ENTRY: size={self.position.size}, entry_price={self.position.entry_price:.4f}, stop={self.position.stop_price:.4f}, equity={self.equity:.2f}, dynamic_scale={dynamic_scale:.3f}"
+                            )
+                            self.history.append(
+                                {
+                                    "date": date,
+                                    "action": "entry",
+                                    "size": self.position.size,
+                                    "entry_price": self.position.entry_price,
+                                    "stop_price": self.position.stop_price,
+                                    "equity": self.equity,
+                                    "dynamic_scale": dynamic_scale,
+                                }
+                            )
+
+            # mark-to-market P&L for open position (not realized)
+            position_value = 0.0
+            if self.position.size > 0:
+                position_value = self.position.size * close
+            net_equity = self.equity  # Equity already includes realized P&L; unrealized is separate if needed
+
+            # record daily returns based on change in total capital if we mark-to-market
+            # For performance metrics we compute returns based on mark-to-market: unrealized included
+            total_capital = net_equity + position_value
+            if len(equity_curve) >= 2:
+                prev_total = equity_curve[-2] + (self.position.size * getattr(df.iloc[i - 1], "Close") if i - 1 >= 0 and self.position.size > 0 else 0.0)
+                # compute daily return in a safe way
+                if prev_total <= 0:
+                    daily_ret = 0.0
+                else:
+                    daily_ret = (total_capital - prev_total) / max(prev_total, 1e-9)
             else:
-                # if signal says exit or short, close position
-                exit_condition = (signal == -1)
-                stop_loss_hit = price <= (self.position_entry_price - self.position_entry_atr * self.stop_atr_multiplier)
-                # trailing stop update if price moved in our favor
-                if price > self.position_entry_price + self.position_entry_atr * self.trailing_stop_atr:
-                    # update trailing stop to capture profits while letting trend run
-                    new_trail = price - self.position_entry_atr * self.trailing_stop_atr
-                    if new_trail > self.trail_stop_price:
-                        self.trail_stop_price = new_trail
+                daily_ret = 0.0
+            returns.append(daily_ret)
 
-                trail_hit = price <= self.trail_stop_price if self.trail_stop_price is not None else False
+            # Update logs and equity tracking
+            # Update peak equity using mark-to-market total_capital
+            self.peak_equity = max(self.peak_equity, total_capital)
+            # if trading disabled and drawdown recovers, re-enable gradually
+            if self.trading_disabled and (self.peak_equity - total_capital) / max(self.peak_equity, 1e-9) < self.config["drawdown_scale_start"]:
+                self.trading_disabled = False
+                self.logger.info(f"{date} - Drawdown recovered below threshold. Re-enabling entries.")
 
-                if exit_condition or stop_loss_hit or trail_hit:
-                    proceeds = self.position * price
-                    proceeds_after_fees = proceeds - (self.commission + self.slippage)
-                    pnl = proceeds_after_fees - (self.position * self.position_entry_price)
-                    self.cash += proceeds_after_fees
-                    logging.debug("Exit long %s @ %.4f size=%.4f pnl=%.2f", date, price, self.position, pnl)
-                    # update daily loss
-                    if pnl < 0:
-                        self.daily_loss += -pnl
-                        # If daily loss exceeds threshold, suspend trading rest of day
-                        daily_max_loss = self.initial_cash * self.daily_max_loss_pct
-                        if self.daily_loss > daily_max_loss:
-                            self.stop_trading_until = date.replace(hour=23, minute=59, second=59)
-                            logging.warning("Daily loss exceeded %.2f, suspending trading until end of day", daily_max_loss)
-                    self.position = 0.0
-                    self.position_entry_price = None
-                    self.position_entry_atr = None
-                    self.trail_stop_price = None
+        # Build performance DataFrame
+        perf = pd.DataFrame({"equity": equity_curve}, index=df.index)
+        perf["returns"] = returns
+        perf["equity_mark_to_market"] = perf["equity"] + (df["Close"] * self.position.size if hasattr(self.position, "size") else 0.0)
 
-            # Equity update
-            position_value = self.position * price
-            self.equity = self.cash + position_value
-            self._record_history(date, price, 'long' if self.position > 0 else 'flat')
-            # Check global drawdown protection
-            self._update_max_equity()
-            if (self.max_equity - self.equity) / max(1e-9, self.max_equity) > self.global_max_drawdown_pct:
-                # Suspend trading for a cooldown period (e.g., 10 trading days)
-                cooldown = timedelta(days=10)
-                self.stop_trading_until = date + cooldown
-                logging.warning("Global drawdown limit reached. Suspending trading until %s", self.stop_trading_until)
-            # daily max loss check (if already in cash, handled above on exit)
-            if self.daily_loss > (self.initial_cash * self.daily_max_loss_pct):
-                self.stop_trading_until = date.replace(hour=23, minute=59, second=59)
-                logging.warning("Daily loss limit reached: %.2f. Stop trading for the day.", self.daily_loss)
-
-        logging.info("Backtest complete. Final equity: %.2f", self.equity)
-        return self._generate_performance()
-
-    def _can_open_new_position(self):
-        # For single-instrument system this checks number of concurrent positions allowed.
-        # Here we restrict to either 0 or 1, but keep architecture for multi-position extension.
-        return 1 <= self.max_positions
-
-    def _update_max_equity(self):
-        if self.equity > self.max_equity:
-            self.max_equity = self.equity
-
-    def _record_history(self, date, price, position_state):
-        self.portfolio_history.append({
-            'date': date,
-            'price': price,
-            'position': self.position,
-            'cash': self.cash,
-            'equity': self.equity,
-            'state': position_state
-        })
-
-    def _generate_performance(self):
-        df = pd.DataFrame(self.portfolio_history).set_index('date')
-        df['returns'] = df['equity'].pct_change().fillna(0)
-        df['cum_return'] = (1 + df['returns']).cumprod() - 1
-        drawdown, max_dd = calculate_drawdowns(df['equity'])
-        df['drawdown'] = drawdown
-        perf = {
-            'final_equity': float(self.equity),
-            'total_return': float(df['cum_return'].iloc[-1]) if len(df) else 0.0,
-            'max_drawdown_pct': float(max_dd),
-            'sharpe': float(sharpe_ratio(df['returns'])),
-            'sortino': float(sortino_ratio(df['returns'])),
-            'history': df
+        # Basic stats
+        total_return = perf["equity"].iloc[-1] / self.initial_equity - 1.0
+        ann_ret = annualized_return(pd.Series(returns))
+        ann_vol = annualized_vol(pd.Series(returns))
+        sr = sharpe_ratio(pd.Series(returns))
+        mdd = max_drawdown(pd.Series(perf["equity"]))
+        win_trades = [h for h in self.history if "pnl" in h and h["pnl"] > 0]
+        loss_trades = [h for h in self.history if "pnl" in h and h["pnl"] <= 0]
+        win_rate = len(win_trades) / max(1, (len(win_trades) + len(loss_trades)))
+        stats = {
+            "total_return": total_return,
+            "annual_return": ann_ret,
+            "annual_vol": ann_vol,
+            "sharpe": sr,
+            "max_drawdown": mdd,
+            "win_rate": win_rate,
+            "n_trades": len([h for h in self.history if h["action"].startswith("exit")]),
         }
-        logging.info("Performance: Final Equity=%.2f TotalReturn=%.2f%% MaxDD=%.2f%% Sharpe=%.3f Sortino=%.3f",
-                     perf['final_equity'],
-                     perf['total_return'] * 100,
-                     perf['max_drawdown_pct'] * 100,
-                     perf['sharpe'],
-                     perf['sortino'] if not np.isnan(perf['sortino']) else -999.0)
-        return perf
 
-# ----------------------------
-# Example usage helper (kept minimal, consistent with preserved architecture)
-# ----------------------------
-def load_price_csv(path):
-    """
-    Load OHLC CSV assumed to have date index and columns: date,open,high,low,close
-    Date inferred as index.
-    """
-    df = pd.read_csv(path, parse_dates=True, index_col=0)
-    df = df.rename(columns={c: c.lower() for c in df.columns})
-    required = {'open', 'high', 'low', 'close'}
-    if not required.issubset(set(df.columns)):
-        raise ValueError(f"CSV must contain columns: {required}")
-    return df[['open', 'high', 'low', 'close']]
+        self.logger.info(f"Backtest complete. Total return: {total_return:.2%}, Annualized return: {ann_ret:.2%}, Sharpe: {sr:.2f}, MaxDD: {mdd:.2%}, Trades: {stats['n_trades']}")
+        return {"perf": perf, "stats": stats, "history": self.history}
 
-# If this module is run directly, run a sample backtest if data exists.
+
+# Helper to get index name attribute for namedtuple rows
+def IndexName(df: pd.DataFrame) -> str:
+    # pandas naming for namedtuple: Index is the index name; when index has no name, attribute is Index
+    # We can use df.index.name if set, else 'Index'
+    name = df.index.name
+    if name is None:
+        return "Index"
+    # If name contains spaces or characters, pandas uses it directly
+    return name
+
+
+# -------------------------
+# Example usage (keeps architecture but does not run on import)
+# -------------------------
 if __name__ == "__main__":
-    config = load_config()
-    setup_logging(config)
-    try:
-        data_path = config.get('backtest', 'data_path', fallback='price.csv')
-    except Exception:
-        data_path = 'price.csv'
-    if os.path.exists(data_path):
-        logging.info("Loading price data from %s", data_path)
-        prices = load_price_csv(data_path)
-        ts = TradingSystem(prices, config=config)
-        perf = ts.run_backtest()
-        # Persist a CSV of history
-        hist = perf['history']
-        hist.to_csv('backtest_history.csv')
-        logging.info("Backtest history saved to backtest_history.csv")
-    else:
-        logging.warning("Data path %s not found. Provide a CSV with OHLC data or set backtest.data_path in config.", data_path)
+    # Minimal sanity test: synthetic data if real data not provided
+    import sys
+
+    def generate_synthetic_data(n_days=500, seed=CONFIG["seed"]):
+        np.random.seed(seed)
+        dates = pd.bdate_range(end=pd.Timestamp.today(), periods=n_days)
+        # simulate log returns with slight drift
+        mu = 0.0002
+        sigma = 0.01
+        rets = np.random.normal(mu, sigma, size=n_days)
+        price = 100 * np.exp(np.cumsum(rets))
+        high = price * (1 + np.random.uniform(0.0, 0.01, size=n_days))
+        low = price * (1 - np.random.uniform(0.0, 0.01, size=n_days))
+        open_ = price * (1 + np.random.uniform(-0.005, 0.005, size=n_days))
+        df = pd.DataFrame({"Open": open_, "High": high, "Low": low, "Close": price}, index=dates)
+        return df
+
+    data = generate_synthetic_data()
+    ts = TradingSystem(CONFIG, logger)
+    result = ts.run_backtest(data)
+    stats = result["stats"]
+    logger.info(f"Stats: {stats}")
