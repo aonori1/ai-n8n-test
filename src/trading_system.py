@@ -1,520 +1,331 @@
 import logging
-import math
-import json
-from copy import deepcopy
-from datetime import datetime, timedelta
-
+import logging.handlers
+import os
+from typing import Dict, Any, Tuple
 import numpy as np
 import pandas as pd
+from math import floor
 
+# -------------------------------------------------------------------
 # Configuration (preserved and extendable)
-CONFIG = {
-    "target_volatility": 0.10,          # annual target volatility for the portfolio (10%)
-    "vol_lookback_days": 20,            # lookback to estimate volatility
-    "atr_lookback": 14,                 # ATR lookback for stop calculations
-    "risk_per_trade": 0.01,             # fraction of equity risked per trade
-    "max_leverage": 3.0,                # maximum gross leverage
-    "commission_per_trade": 0.0005,     # commission as fraction of traded notional
-    "slippage_per_trade": 0.0005,       # slippage fraction
-    "signal_smoothing_span": 5,         # EMA span for smoothing raw signals
-    "entry_zscore": 1.0,                # z-score threshold to enter
-    "exit_zscore": 0.5,                 # z-score threshold to exit / reduce
-    "min_trade_value": 100.0,           # minimum notional to open a position
-    "portfolio_max_drawdown": 0.20,     # stop trading if portfolio drawdown > 20%
-    "cooldown_days_after_dd": 5,        # cooldown after large portfolio drawdown
-    "max_position_concentration": 0.30, # max fraction of capital in single position
-    "risk_scaling_by_volatility": True,  # scale position sizes by individual vol
-    "use_trailing_stop": True,
-    "trailing_stop_atr_mult": 3.0,       # ATR multiple for trailing stop
-    "fixed_stop_atr_mult": 4.0,         # ATR multiple for initial stop
-    "logging_config": {
-        "level": logging.INFO,
-        "fmt": "%(asctime)s %(levelname)s %(message)s"
-    }
+# -------------------------------------------------------------------
+CONFIG: Dict[str, Any] = {
+    "initial_capital": 1_000_000.0,
+    "risk_per_trade": 0.005,               # fraction of equity to risk per trade (0.5%)
+    "max_portfolio_risk": 0.02,            # maximum fraction of equity at risk across all open trades
+    "target_annual_vol": 0.10,             # volatility targeting (10% annual)
+    "max_leverage": 3.0,                   # maximum portfolio leverage from vol targeting
+    "atr_period": 21,
+    "atr_multiplier": 3.0,                 # stop distance in ATRs
+    "trailing_atr_multiplier": 2.0,        # trailing stop distance in ATRs
+    "volatility_filter_period": 63,        # lookback for realized volatility filter
+    "volatility_filter_multiplier": 1.25,  # only take trades if current vol < multiplier * long_term_vol
+    "ma_fast": 20,
+    "ma_slow": 100,
+    "max_concurrent_positions": 5,
+    "max_drawdown_tol": 0.25,              # if equity drawdown exceeds 25% stop trading
+    "cooldown_days_after_dd": 10,          # days to pause after hitting drawdown tolerance
+    "commission_per_trade": 1.0,           # flat commission per trade
+    "slippage_pct": 0.0005,                # slippage per trade as pct of trade value
+    "log_dir": "logs",
+    "log_file": "trading_system.log",
+    "verbose": True
 }
 
-# Set up logger (preserved)
-logging.basicConfig(level=CONFIG["logging_config"]["level"], format=CONFIG["logging_config"]["fmt"])
+# -------------------------------------------------------------------
+# Logging (preserved)
+# -------------------------------------------------------------------
+os.makedirs(CONFIG["log_dir"], exist_ok=True)
 logger = logging.getLogger("TradingSystem")
+logger.setLevel(logging.DEBUG if CONFIG["verbose"] else logging.INFO)
+formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+file_handler = logging.handlers.RotatingFileHandler(
+    os.path.join(CONFIG["log_dir"], CONFIG["log_file"]),
+    maxBytes=5_000_000,
+    backupCount=3
+)
+file_handler.setFormatter(formatter)
+logger.addHandler(file_handler)
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(formatter)
+logger.addHandler(console_handler)
 
 
+# -------------------------------------------------------------------
+# Utilities
+# -------------------------------------------------------------------
+def atr(series_high: pd.Series, series_low: pd.Series, series_close: pd.Series, period: int) -> pd.Series:
+    """Compute ATR using Wilder's smoothing."""
+    high_low = series_high - series_low
+    high_close = (series_high - series_close.shift(1)).abs()
+    low_close = (series_low - series_close.shift(1)).abs()
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    atr_val = tr.ewm(alpha=1 / period, adjust=False).mean()
+    return atr_val
+
+
+def annualized_vol(returns: pd.Series, trading_days: int = 252) -> float:
+    return float(returns.std() * np.sqrt(trading_days))
+
+
+# -------------------------------------------------------------------
+# Trading System
+# -------------------------------------------------------------------
 class TradingSystem:
-    """
-    TradingSystem: signal generation + risk management + backtesting logic.
-    Architecture:
-      - Input: dictionary of pandas DataFrames keyed by asset symbol. Each DataFrame must have columns:
-               ['open', 'high', 'low', 'close', 'volume'] and a DateTime index.
-      - Methods:
-         generate_raw_signals: user-defined signal logic (kept simple for architecture consistency).
-         smooth_signals: reduce turnover and false signals.
-         compute_volatility_and_atr: helper to compute vol and ATR.
-         size_positions: volatility-targeted sizing with risk per trade and concentration limits.
-         apply_stops_and_risk: attach stop levels to positions.
-         backtest: simulates the portfolio over time, logs trades, computes metrics.
-    """
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config.copy()
+        self.equity = config["initial_capital"]
+        self.cash = config["initial_capital"]
+        self.positions: Dict[str, Dict[str, Any]] = {}  # symbol -> {size, entry_price, stop, trail}
+        self.trade_log = []
+        self.daily_equity = []
+        self.in_cooldown_until = None
+        logger.info("Trading system initialized with capital: %.2f", self.equity)
 
-    def __init__(self, price_data: dict, config: dict = None):
-        self.config = deepcopy(CONFIG)
-        if config:
-            self.config.update(config)
-        self.price_data = price_data  # dict of DataFrames
-        # Check data
-        for sym, df in self.price_data.items():
-            if not isinstance(df, pd.DataFrame):
-                raise ValueError(f"Price data for {sym} must be a pandas DataFrame")
-            required = {"open", "high", "low", "close"}
-            if not required.issubset(set(df.columns)):
-                raise ValueError(f"Price data for {sym} must contain columns {required}")
-        # Internal state
-        self.signals = {}       # raw signals per asset (DataFrame)
-        self.smoothed = {}      # smoothed signals per asset (Series)
-        self.volatility = {}    # estimated vol per asset (Series)
-        self.atr = {}           # ATR per asset (Series)
-        # Logs and results
-        self.trade_log = []     # list of trade dicts
-        self.daily_log = []     # daily portfolio snapshots
-
-        logger.info("Trading system initialized with %d assets", len(self.price_data))
-
-    # ---------- Indicator computations ----------
-    @staticmethod
-    def compute_atr(df: pd.DataFrame, lookback: int) -> pd.Series:
-        high = df["high"]
-        low = df["low"]
-        close = df["close"]
-        tr1 = high - low
-        tr2 = (high - close.shift(1)).abs()
-        tr3 = (low - close.shift(1)).abs()
-        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-        atr = tr.rolling(lookback, min_periods=1).mean()
-        return atr
-
-    @staticmethod
-    def compute_rolling_vol(df: pd.DataFrame, lookback: int) -> pd.Series:
-        # Use log returns to estimate volatility
-        logret = np.log(df["close"] / df["close"].shift(1)).fillna(0.0)
-        # Annualize assuming 252 trading days
-        vol = logret.rolling(lookback, min_periods=1).std() * math.sqrt(252)
-        return vol
-
-    # ---------- Signal generation & smoothing ----------
-    def generate_raw_signals(self):
+    def generate_signals(self, price_df: pd.DataFrame) -> pd.DataFrame:
         """
-        Place-holder signal generator. For each asset we compute a momentum z-score over vol_lookback_days.
-        This keeps architecture consistent (user can replace this), and provides a reasonable baseline.
+        price_df expected columns: ['open','high','low','close','volume'] indexed by datetime
+        Single-symbol system for clarity; extendable to multi-asset.
+        Returns a DataFrame with a 'signal' column: 1 buy, -1 sell/short (we use only long here), 0 flat
         """
-        lookback = self.config["vol_lookback_days"]
-        for sym, df in self.price_data.items():
-            close = df["close"]
-            returns = close.pct_change().fillna(0.0)
-            # Momentum: cumulative return over lookback
-            cumret = (1 + returns).rolling(lookback, min_periods=1).apply(lambda x: np.prod(x) - 1.0)
-            # Standardize the momentum to produce a z-score
-            mu = cumret.rolling(lookback, min_periods=1).mean()
-            sigma = cumret.rolling(lookback, min_periods=1).std().replace(0, 1e-9)
-            z = (cumret - mu) / sigma
-            self.signals[sym] = z.rename("raw_signal")
-            logger.debug("Generated raw signals for %s", sym)
+        df = price_df.copy()
+        df["ma_fast"] = df["close"].rolling(self.config["ma_fast"]).mean()
+        df["ma_slow"] = df["close"].rolling(self.config["ma_slow"]).mean()
+        df["atr"] = atr(df["high"], df["low"], df["close"], self.config["atr_period"])
+        df["ret"] = df["close"].pct_change()
+        df["realized_vol"] = df["ret"].rolling(self.config["volatility_filter_period"]).std() * np.sqrt(252)
+        # Basic moving average crossover
+        df["ma_signal"] = 0
+        df.loc[df["ma_fast"] > df["ma_slow"], "ma_signal"] = 1
+        df.loc[df["ma_fast"] < df["ma_slow"], "ma_signal"] = 0
+        # Signal only when trend and volatility filter satisfied
+        df["vol_filter_pass"] = df["realized_vol"] < (self.config["volatility_filter_multiplier"] * df["realized_vol"].rolling(252, min_periods=1).mean())
+        df["signal"] = 0
+        df.loc[(df["ma_signal"] == 1) & (df["vol_filter_pass"]), "signal"] = 1
+        # De-noise: require ma_fast to be sufficiently above ma_slow (relative threshold)
+        rel_thresh = 0.005  # 0.5% above
+        df.loc[(df["ma_signal"] == 1) & ((df["ma_fast"] - df["ma_slow"]) / df["ma_slow"] < rel_thresh), "signal"] = 0
+        logger.debug("Signals generated (head):\n%s", df[["close", "ma_fast", "ma_slow", "atr", "realized_vol", "signal"]].head(10))
+        return df
 
-    def smooth_signals(self):
+    def size_position(self, price: float, stop_distance: float, equity: float) -> int:
         """
-        Smooth raw signals with EMA to reduce turnover and noise.
+        Determine number of shares/contracts to buy given risk per trade and stop distance.
+        stop_distance: absolute price distance to stop (dollars)
         """
-        span = self.config["signal_smoothing_span"]
-        for sym, raw in self.signals.items():
-            sm = raw.ewm(span=span, adjust=False).mean()
-            self.smoothed[sym] = sm.rename("smoothed_signal")
-            logger.debug("Smoothed signals for %s with span %s", sym, span)
+        if stop_distance <= 0 or price <= 0:
+            return 0
+        risk_amount = equity * self.config["risk_per_trade"]
+        raw_size = risk_amount / (stop_distance)
+        size = max(0, floor(raw_size))
+        logger.debug("Sizing position: price=%.4f stop_dist=%.4f equity=%.2f risk_amt=%.2f raw_size=%.2f -> size=%d",
+                     price, stop_distance, equity, risk_amount, raw_size, size)
+        return size
 
-    # ---------- Position sizing and risk management ----------
-    def compute_volatility_and_atr(self):
+    def apply_vol_targeting(self, allocation_notional: float, returns: pd.Series) -> float:
         """
-        Compute per-asset volatility and ATR series for use in sizing & stops.
+        Scale allocation notional according to volatility targeting.
+        Returns scaled notional (absolute dollars).
         """
-        vol_lookback = self.config["vol_lookback_days"]
-        atr_lookback = self.config["atr_lookback"]
-        for sym, df in self.price_data.items():
-            self.volatility[sym] = self.compute_rolling_vol(df, vol_lookback).rename("vol")
-            self.atr[sym] = self.compute_atr(df, atr_lookback).rename("atr")
-            logger.debug("Computed vol and atr for %s", sym)
+        current_vol = annualized_vol(returns.dropna()) if returns.dropna().shape[0] >= 2 else None
+        if current_vol is None or current_vol == 0:
+            logger.debug("Vol targeting: insufficient vol data; skipping scaling.")
+            return allocation_notional
+        scale = self.config["target_annual_vol"] / current_vol
+        scale = min(scale, self.config["max_leverage"])
+        scaled = allocation_notional * scale
+        logger.debug("Vol targeting: current_vol=%.4f target=%.4f scale=%.4f -> scaled_notional=%.2f",
+                     current_vol, self.config["target_annual_vol"], scale, scaled)
+        return scaled
 
-    def size_positions(self, date, portfolio_value, prices):
+    def _enter_trade(self, symbol: str, price: float, size: int, atr_val: float, date: pd.Timestamp):
+        stop_distance = atr_val * self.config["atr_multiplier"]
+        stop_price = price - stop_distance
+        trail_distance = atr_val * self.config["trailing_atr_multiplier"]
+        trail_stop = price - trail_distance
+        self.positions[symbol] = {
+            "size": size,
+            "entry_price": price,
+            "stop_price": stop_price,
+            "trail_stop": trail_stop,
+            "atr": atr_val,
+            "entry_date": date
+        }
+        cost = price * size
+        total_commission = self.config["commission_per_trade"]
+        slippage = abs(cost) * self.config["slippage_pct"]
+        self.cash -= (cost + total_commission + slippage)
+        logger.info("ENTER %s %s shares at %.4f on %s | stop=%.4f trail=%.4f cost=%.2f",
+                    symbol, size, price, date.strftime("%Y-%m-%d"), stop_price, trail_stop, cost)
+
+    def _exit_trade(self, symbol: str, price: float, date: pd.Timestamp, reason: str):
+        pos = self.positions.pop(symbol, None)
+        if pos is None:
+            return
+        size = pos["size"]
+        proceeds = price * size
+        commission = self.config["commission_per_trade"]
+        slippage = abs(proceeds) * self.config["slippage_pct"]
+        self.cash += (proceeds - commission - slippage)
+        pnl = (price - pos["entry_price"]) * size - commission - slippage
+        self.trade_log.append({
+            "symbol": symbol,
+            "entry_date": pos["entry_date"],
+            "exit_date": date,
+            "entry_price": pos["entry_price"],
+            "exit_price": price,
+            "size": size,
+            "pnl": pnl,
+            "reason": reason
+        })
+        logger.info("EXIT %s %d shares at %.4f on %s | pnl=%.2f reason=%s",
+                    symbol, size, price, date.strftime("%Y-%m-%d"), pnl, reason)
+
+    def backtest(self, price_df: pd.DataFrame, symbol: str = "SYM") -> Dict[str, Any]:
         """
-        Determine position sizes at a given date given smoothed signals and volatility targeting.
-
-        - Uses risk_per_trade to limit loss per trade.
-        - Scales position size by volatility: larger positions in lower-vol assets if risk_scaling_by_volatility enabled.
-        - Caps per-position exposure by max_position_concentration and portfolio leverage by max_leverage.
-        - Returns dict: symbol -> target_shares (signed).
+        Single-symbol backtest to improve risk-adjusted performance:
+        - ATR stop
+        - Volatility targeting
+        - Max concurrent positions
+        - Drawdown/cooldown rules
         """
-        target_vol = self.config["target_volatility"]
-        risk_per_trade = self.config["risk_per_trade"]
-        max_conc = self.config["max_position_concentration"]
-        min_trade_value = self.config["min_trade_value"]
-        max_leverage = self.config["max_leverage"]
+        df = self.generate_signals(price_df)
+        df = df.dropna(subset=["close"])
+        equity_series = []
+        peak_equity = self.equity
+        cooldown_days_remaining = 0
 
-        # Collect candidate signals and vols at date
-        assets = []
-        for sym, sm in self.smoothed.items():
-            if date not in sm.index:
-                continue
-            signal = sm.at[date]
-            vol_series = self.volatility.get(sym)
-            if vol_series is None or date not in vol_series.index:
-                continue
-            vol = vol_series.at[date]
-            price = prices.get(sym)
-            if price is None or price <= 0 or not np.isfinite(price):
-                continue
-            assets.append((sym, float(signal), float(vol), float(price)))
+        # iterate through rows
+        for date, row in df.iterrows():
+            price = float(row["close"])
+            atr_val = float(row["atr"]) if not np.isnan(row["atr"]) else 0.0
+            signal = int(row["signal"])
 
-        # Convert into DataFrame
-        if not assets:
-            return {}
-
-        df = pd.DataFrame(assets, columns=["sym", "signal", "vol", "price"]).set_index("sym")
-        # Only consider signals above entry threshold magnitude
-        entry_z = self.config["entry_zscore"]
-        df["dir"] = np.sign(df["signal"])
-        df["strength"] = df["signal"].abs()
-        df = df[df["strength"] >= entry_z]
-        if df.empty:
-            return {}
-
-        # Volatility-adjusted notional per asset: target_vol * portfolio_value * (signal_strength / sum_strength)
-        sum_strength = df["strength"].sum()
-        if sum_strength <= 0:
-            return {}
-
-        # Notional allocation before risk-per-trade & concentration cap
-        notional_alloc = {}
-        for sym, row in df.iterrows():
-            weight = row["strength"] / sum_strength
-            notional = portfolio_value * target_vol * weight / max(row["vol"], 1e-6)
-            notional_alloc[sym] = notional
-
-        # Convert notional to shares using price and apply risk per trade and concentration limits
-        target_shares = {}
-        for sym in df.index:
-            price = df.at[sym, "price"]
-            vol = df.at[sym, "vol"]
-            dir_sign = int(df.at[sym, "dir"])
-            # Risk per trade logic: compute stop distance in price units conservatively using atr*fixed_stop_atr_mult
-            atr_series = self.atr.get(sym)
-            stop_dist = None
-            if atr_series is not None and date in atr_series.index:
-                stop_dist = atr_series.at[date] * self.config["fixed_stop_atr_mult"]
-            # fallback to percent (e.g., 2% of price)
-            if not stop_dist or stop_dist <= 0:
-                stop_dist = price * 0.02
-            # Max notional based on risk_per_trade: notional <= (risk_per_trade * portfolio_value) / (stop_dist / price)
-            notional_based_on_risk = (risk_per_trade * portfolio_value) / (stop_dist / price)
-            notional = min(notional_alloc[sym], notional_based_on_risk, max_conc * portfolio_value)
-            # Ensure minimum trade size
-            if notional < min_trade_value:
-                continue
-            shares = math.floor(notional / price)
-            if shares == 0:
-                continue
-            target_shares[sym] = dir_sign * int(shares)
-
-        # Cap total leverage: ensure sum(abs(notional))/portfolio_value <= max_leverage
-        total_notional = sum(abs(shares * self.price_data[sym].loc[date, "close"]) for sym, shares in target_shares.items())
-        if total_notional / portfolio_value > max_leverage:
-            scale = (max_leverage * portfolio_value) / total_notional
-            for sym in list(target_shares.keys()):
-                adj = int(math.floor(abs(target_shares[sym]) * scale))
-                target_shares[sym] = np.sign(target_shares[sym]) * adj
-                if target_shares[sym] == 0:
-                    del target_shares[sym]
-
-        logger.debug("Sized positions for %s: %s", date, target_shares)
-        return target_shares
-
-    # ---------- Backtest / execution ----------
-    def backtest(self, start_date=None, end_date=None, initial_capital=1_000_000):
-        """
-        Run a simple backtest over the intersection of asset dates.
-        Execution model:
-          - Daily bar simulation (open->close)
-          - Orders executed at next day's open (slippage+commission applied)
-          - Stop-losses executed intraday conservatively at worse of (stop price, low) simplified to close price adjustment
-        """
-        # Prepare combined date index: intersection of all assets' indices
-        common_index = None
-        for df in self.price_data.values():
-            if common_index is None:
-                common_index = df.index
+            # enforce cooldown from large drawdown
+            if self.in_cooldown_until is not None and date <= self.in_cooldown_until:
+                logger.debug("In cooldown until %s; skipping new entries on %s", self.in_cooldown_until, date)
+                allow_new_entries = False
             else:
-                common_index = common_index.intersection(df.index)
-        if common_index is None or common_index.empty:
-            raise ValueError("No common dates across assets")
+                allow_new_entries = True
 
-        if start_date:
-            common_index = common_index[common_index >= pd.to_datetime(start_date)]
-        if end_date:
-            common_index = common_index[common_index <= pd.to_datetime(end_date)]
-        if common_index.empty:
-            raise ValueError("No dates in the requested range after applying start/end")
+            # Update trailing stops for open positions
+            for sym, pos in list(self.positions.items()):
+                # update trailing stop: only tighten
+                new_trail = price - pos["atr"] * self.config["trailing_atr_multiplier"]
+                if new_trail > pos["trail_stop"]:
+                    logger.debug("Tightening trailing stop for %s from %.4f to %.4f", sym, pos["trail_stop"], new_trail)
+                    pos["trail_stop"] = new_trail
+                # Check stops: stop_price or trail_stop hit -> exit
+                if price <= pos["stop_price"]:
+                    self._exit_trade(sym, price, date, reason="stop_loss")
+                elif price <= pos["trail_stop"]:
+                    self._exit_trade(sym, price, date, reason="trailing_stop")
 
-        # Pre-compute indicators
-        self.generate_raw_signals()
-        self.smooth_signals()
-        self.compute_volatility_and_atr()
-
-        # Backtest state
-        cash = float(initial_capital)
-        positions = {}  # sym -> shares (signed)
-        portfolio_value = float(initial_capital)
-        peak_value = portfolio_value
-        last_dd_date = None
-        cooldown_until = None
-
-        # Run through each date
-        for current_date in common_index:
-            # Skip during cooldown
-            if cooldown_until is not None and current_date <= cooldown_until:
-                self.daily_log.append({
-                    "date": current_date,
-                    "cash": cash,
-                    "positions": deepcopy(positions),
-                    "portfolio_value": portfolio_value
-                })
-                continue
-
-            # Build price lookup at current_date (use close price for marking)
-            prices = {}
-            for sym, df in self.price_data.items():
-                if current_date in df.index:
-                    prices[sym] = float(df.loc[current_date, "close"])
-            # Compute mark-to-market
-            current_notional = sum(positions.get(sym, 0) * prices.get(sym, 0.0) for sym in prices)
-            portfolio_value = cash + current_notional
-
-            # Check portfolio drawdown stop
-            peak_value = max(peak_value, portfolio_value)
-            drawdown = 1.0 - (portfolio_value / peak_value) if peak_value > 0 else 0.0
-            if drawdown >= self.config["portfolio_max_drawdown"]:
-                # Enter cooldown period
-                cooldown_days = self.config["cooldown_days_after_dd"]
-                cooldown_until = current_date + timedelta(days=cooldown_days)
-                logger.warning("Portfolio drawdown %.2f >= max_drawdown %.2f on %s. Cooling until %s",
-                               drawdown, self.config["portfolio_max_drawdown"], current_date, cooldown_until)
-                self.daily_log.append({
-                    "date": current_date,
-                    "cash": cash,
-                    "positions": deepcopy(positions),
-                    "portfolio_value": portfolio_value,
-                    "drawdown": drawdown
-                })
-                continue
-
-            # Determine target positions (sized on current prices)
-            target_shares = self.size_positions(current_date, portfolio_value, prices)
-
-            # Generate trades: close, reduce or open positions at next open (we simulate immediate execution at close with slippage)
-            # For fairness, we execute trades at current close price with slippage and commission applied.
-            executed_trades = []
-            for sym in set(list(positions.keys()) + list(target_shares.keys())):
-                current_shares = positions.get(sym, 0)
-                target = target_shares.get(sym, 0)
-                if current_shares == target:
-                    continue
-                # Execute
-                price = prices.get(sym)
-                if price is None:
-                    # cannot execute if price not available
-                    continue
-                qty = target - current_shares
-                # Slippage & commissions reduce cash
-                trade_notional = qty * price
-                slippage = abs(trade_notional) * self.config["slippage_per_trade"]
-                commission = abs(trade_notional) * self.config["commission_per_trade"]
-                cash -= trade_notional  # pay for buys, receive for sells
-                cash -= slippage
-                cash -= commission
-                positions[sym] = target  # set new position
-                executed_trades.append({
-                    "date": current_date,
-                    "symbol": sym,
-                    "shares": int(qty),
-                    "price": price,
-                    "notional": trade_notional,
-                    "slippage": slippage,
-                    "commission": commission
-                })
-                # Log trade
-                self.trade_log.append({
-                    "date": current_date,
-                    "symbol": sym,
-                    "shares": int(qty),
-                    "price": price,
-                    "notional": trade_notional,
-                    "slippage": slippage,
-                    "commission": commission,
-                    "reason": "rebalance"
-                })
-
-            # Update marks after execution
-            current_notional = sum(positions.get(sym, 0) * prices.get(sym, 0.0) for sym in prices)
-            portfolio_value = cash + current_notional
-            peak_value = max(peak_value, portfolio_value)
-            drawdown = 1.0 - (portfolio_value / peak_value) if peak_value > 0 else 0.0
-
-            # Apply stop-loss/trailing stops conservatively at close price:
-            # If a position has moved against us beyond the fixed stop (atr-based), we close it.
-            stops_triggered = []
-            for sym, shares in list(positions.items()):
-                if shares == 0:
-                    continue
-                df = self.price_data[sym]
-                # we require that we have today's high/low to check intraday movement
-                if current_date not in df.index:
-                    continue
-                row = df.loc[current_date]
-                close = float(row["close"])
-                low = float(row.get("low", close))
-                high = float(row.get("high", close))
-                # Directional stop: initial stop based on ATR from that asset
-                atr_series = self.atr.get(sym)
-                if atr_series is not None and current_date in atr_series.index:
-                    atr_val = atr_series.at[current_date]
+            # Check if we should open a new trade
+            if signal == 1 and allow_new_entries:
+                # Respect max concurrent positions
+                if len(self.positions) < self.config["max_concurrent_positions"]:
+                    # compute stop distance from ATR
+                    stop_distance = atr_val * self.config["atr_multiplier"] if atr_val > 0 else max(0.01 * price, 1.0)
+                    # compute nominal allocation before vol targeting
+                    raw_notional = self.equity / max(1, self.config["max_concurrent_positions"])
+                    # Apply volatility targeting to notional to avoid oversized positions in calm markets
+                    scaled_notional = self.apply_vol_targeting(raw_notional, df["ret"].loc[:date])
+                    # initial size from risk per trade and stop distance (but also cap by scaled_notional)
+                    size_by_risk = self.size_position(price, stop_distance, self.equity)
+                    size_by_notional = max(0, floor(scaled_notional / price))
+                    size = int(min(size_by_risk, size_by_notional))
+                    # Ensure we don't violate portfolio-level max risk
+                    estimated_risk = size * stop_distance
+                    max_port_risk_amt = self.equity * self.config["max_portfolio_risk"]
+                    total_current_risk = sum([p["size"] * (p["atr"] * self.config["atr_multiplier"]) for p in self.positions.values()])
+                    if (total_current_risk + estimated_risk) > max_port_risk_amt:
+                        logger.debug("Skipping entry due to portfolio risk cap. total_current_risk=%.2f estimated_risk=%.2f max_port_risk_amt=%.2f",
+                                     total_current_risk, estimated_risk, max_port_risk_amt)
+                        size = 0
+                    if size > 0:
+                        # Apply cash/leverage check
+                        notional = size * price
+                        # determine available buying power (allow some leverage up to max_leverage * equity)
+                        max_notional = self.equity * self.config["max_leverage"]
+                        current_notional = sum([p["size"] * p["entry_price"] for p in self.positions.values()])
+                        if (current_notional + notional) <= max_notional:
+                            self._enter_trade(symbol, price, size, atr_val, date)
+                        else:
+                            logger.debug("Skipping entry due to leverage cap. current_notional=%.2f notional=%.2f max_notional=%.2f",
+                                         current_notional, notional, max_notional)
                 else:
-                    atr_val = close * 0.02
-                # For long positions, stop = entry_price - fixed_stop_atr_mult*atr
-                # Since we do not track entry_price per position in this simplified simulator,
-                # use current close as proxy for entry for new positions; this is conservative.
-                # A better simulator would track per-lot entry prices.
-                if shares > 0:
-                    stop_price = close - self.config["fixed_stop_atr_mult"] * atr_val
-                    trailing = close - self.config["trailing_stop_atr_mult"] * atr_val if self.config["use_trailing_stop"] else None
-                    stop_triggered = low <= stop_price
-                else:
-                    stop_price = close + self.config["fixed_stop_atr_mult"] * atr_val
-                    trailing = close + self.config["trailing_stop_atr_mult"] * atr_val if self.config["use_trailing_stop"] else None
-                    stop_triggered = high >= stop_price
-                if stop_triggered:
-                    # Close the position fully at close (conservative)
-                    qty = -positions[sym]
-                    notional = qty * close
-                    slippage = abs(notional) * self.config["slippage_per_trade"]
-                    commission = abs(notional) * self.config["commission_per_trade"]
-                    cash -= notional
-                    cash -= slippage
-                    cash -= commission
-                    self.trade_log.append({
-                        "date": current_date,
-                        "symbol": sym,
-                        "shares": int(qty),
-                        "price": close,
-                        "notional": notional,
-                        "slippage": slippage,
-                        "commission": commission,
-                        "reason": "stop_loss"
-                    })
-                    positions[sym] = 0
-                    stops_triggered.append(sym)
+                    logger.debug("Max concurrent positions reached (%d). Skipping new entry.", self.config["max_concurrent_positions"])
 
-            # Remove zero positions to keep dict small
-            positions = {s: q for s, q in positions.items() if q != 0}
-
-            # Mark portfolio and record daily
-            current_notional = sum(positions.get(sym, 0) * prices.get(sym, 0.0) for sym in prices)
-            portfolio_value = cash + current_notional
-            self.daily_log.append({
-                "date": current_date,
-                "cash": cash,
-                "positions": deepcopy(positions),
-                "portfolio_value": portfolio_value,
+            # Daily P&L update: mark-to-market positions
+            mtm_pnl = sum([(price - p["entry_price"]) * p["size"] for p in self.positions.values()])
+            unrealized = mtm_pnl
+            total_equity = self.cash + sum([p["size"] * price for p in self.positions.values()])
+            self.equity = total_equity
+            equity_series.append((date, total_equity))
+            # track peak equity and drawdown
+            if total_equity > peak_equity:
+                peak_equity = total_equity
+            drawdown = (peak_equity - total_equity) / peak_equity if peak_equity > 0 else 0.0
+            if drawdown >= self.config["max_drawdown_tol"]:
+                # initiate cooldown
+                self.in_cooldown_until = date + pd.Timedelta(days=self.config["cooldown_days_after_dd"])
+                logger.warning("Drawdown %.2f exceeded tolerance %.2f. Entering cooldown until %s.", drawdown, self.config["max_drawdown_tol"], self.in_cooldown_until)
+            # Store daily metrics
+            self.daily_equity.append({
+                "date": date,
+                "equity": total_equity,
+                "cash": self.cash,
+                "positions_notional": sum([p["size"] * price for p in self.positions.values()]),
+                "mtm_unrealized": unrealized,
                 "drawdown": drawdown
             })
 
-        # End of backtest - compute metrics
-        results = self.calculate_metrics(initial_capital)
-        logger.info("Backtest complete. Final portfolio value: %.2f, Sharpe: %.3f, MaxDrawdown: %.3f",
-                    results["final_value"], results["sharpe"], results["max_drawdown"])
-        return results
+        # On backtest end: close all positions at last price
+        last_date, last_row = df.index[-1], df.iloc[-1]
+        last_price = float(last_row["close"])
+        for sym in list(self.positions.keys()):
+            self._exit_trade(sym, last_price, last_date, reason="end_of_backtest")
 
-    # ---------- Performance metrics ----------
-    def calculate_metrics(self, initial_capital):
-        """
-        Compute daily returns, Sharpe, max drawdown, CAGR.
-        """
-        df_daily = pd.DataFrame(self.daily_log)
-        if df_daily.empty:
-            return {
-                "final_value": initial_capital,
-                "returns": pd.Series(dtype=float),
-                "sharpe": 0.0,
-                "max_drawdown": 0.0,
-                "cagr": 0.0
-            }
-
-        df_daily = df_daily.set_index("date").sort_index()
-        pv = df_daily["portfolio_value"].astype(float)
-        returns = pv.pct_change().fillna(0.0)
-        # Annualized Sharpe (assume 252 trading days)
-        avg = returns.mean() * 252
-        vol = returns.std() * math.sqrt(252)
-        sharpe = (avg / vol) if vol > 0 else 0.0
-        # Max drawdown
-        running_max = pv.cummax()
-        drawdowns = 1.0 - (pv / running_max)
-        max_dd = drawdowns.max()
-        # CAGR
-        total_days = (pv.index[-1] - pv.index[0]).days or 1
-        years = total_days / 365.25
-        cagr = (pv.iloc[-1] / pv.iloc[0]) ** (1 / years) - 1 if years > 0 else 0.0
-
-        results = {
-            "final_value": float(pv.iloc[-1]),
-            "returns": returns,
-            "sharpe": float(sharpe),
-            "max_drawdown": float(max_dd),
-            "cagr": float(cagr),
-            "daily": df_daily,
-            "trade_log": pd.DataFrame(self.trade_log)
+        result = {
+            "initial_capital": self.config["initial_capital"],
+            "final_equity": self.equity,
+            "trade_log": pd.DataFrame(self.trade_log),
+            "daily_equity": pd.DataFrame(self.daily_equity).set_index("date")
         }
-        return results
-
-    # ---------- Utility: save logs and configuration ----------
-    def save_state(self, trade_log_path="trade_log.csv", daily_log_path="daily_log.csv", config_path="config.json"):
-        try:
-            pd.DataFrame(self.trade_log).to_csv(trade_log_path, index=False)
-            pd.DataFrame(self.daily_log).to_csv(daily_log_path, index=False)
-            with open(config_path, "w") as f:
-                json.dump(self.config, f, indent=2, default=str)
-            logger.info("Saved trade log, daily log, and configuration.")
-        except Exception as e:
-            logger.exception("Failed to save state: %s", e)
+        logger.info("Backtest complete. Initial capital=%.2f Final equity=%.2f", result["initial_capital"], result["final_equity"])
+        return result
 
 
-# ---------- Example usage (kept for completeness, remove or adapt for production) ----------
+# -------------------------------------------------------------------
+# Example Runner (keeps configuration and logging)
+# -------------------------------------------------------------------
+def load_price_csv(path: str) -> pd.DataFrame:
+    """
+    Load CSV with columns: date, open, high, low, close, volume
+    Date parsed as index. This helper preserves architecture for file-based inputs.
+    """
+    df = pd.read_csv(path, parse_dates=["date"])
+    df = df.set_index("date").sort_index()
+    required = {"open", "high", "low", "close", "volume"}
+    if not required.issubset(df.columns):
+        raise ValueError(f"CSV missing required columns. Required: {required}")
+    return df
+
+
 if __name__ == "__main__":
-    # Minimal example to demonstrate API (users will replace with real data loader)
-    symbols = ["AAA", "BBB"]
-    dates = pd.date_range("2020-01-01", "2021-12-31", freq="B")
-    np.random.seed(42)
-
-    price_data = {}
-    for sym in symbols:
-        # Simulate random walk price series
-        p = 100 + np.cumsum(np.random.normal(0, 1, len(dates)))
-        high = p + np.random.uniform(0, 1.0, len(p))
-        low = p - np.random.uniform(0, 1.0, len(p))
-        openp = p + np.random.uniform(-0.5, 0.5, len(p))
-        volume = np.random.randint(100, 1000, len(p))
-        df = pd.DataFrame({
-            "open": openp,
-            "high": high,
-            "low": low,
-            "close": p,
-            "volume": volume
-        }, index=dates)
-        price_data[sym] = df
-
-    # Create system and run backtest
-    ts = TradingSystem(price_data)
-    results = ts.backtest(initial_capital=1_000_000)
-    # Save logs and config
-    ts.save_state()
+    # Example usage: python trading_system.py data.csv
+    import sys
+    if len(sys.argv) < 2:
+        logger.error("Please provide a CSV data file path as the first argument.")
+        sys.exit(1)
+    data_path = sys.argv[1]
+    prices = load_price_csv(data_path)
+    ts = TradingSystem(CONFIG)
+    results = ts.backtest(prices, symbol="SYM")
+    # Save outputs
+    out_dir = "results"
+    os.makedirs(out_dir, exist_ok=True)
+    results["trade_log"].to_csv(os.path.join(out_dir, "trade_log.csv"), index=False)
+    results["daily_equity"].to_csv(os.path.join(out_dir, "daily_equity.csv"))
+    logger.info("Results written to %s", out_dir)
