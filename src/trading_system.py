@@ -1,384 +1,473 @@
 import logging
 import math
+import os
+from dataclasses import dataclass, asdict
+from datetime import datetime
+from typing import List, Dict, Optional
+
 import numpy as np
 import pandas as pd
-from dataclasses import dataclass, field
-from typing import Optional, Dict, Any, List
+
 
 # -------------------------
-# Configuration (preserved / extended)
+# Configuration (preserved & extendable)
 # -------------------------
 CONFIG = {
     "initial_capital": 100000.0,
-    "risk_per_trade": 0.01,            # fraction of equity risked per trade
-    "max_position_size_pct": 0.2,      # maximum fraction of equity in a single position
-    "atr_length": 14,
-    "atr_multiplier_stop": 3.0,        # initial stop = entry - atr_multiplier_stop * ATR
-    "atr_multiplier_trail": 2.0,       # trailing stop distance in ATRs
-    "ema_short": 20,
-    "ema_long": 50,
-    "ema_trend": 200,                  # long-term trend filter
-    "volatility_filter_max_atr_pct": 0.05,  # if ATR/price > this, avoid new trades
-    "min_trade_days_between": 1,       # minimum days between consecutive entries
-    "max_drawdown_stop": 0.25,         # if equity drawdown exceeds this, halt new entries
-    "slippage_per_share": 0.0,
-    "commission_per_trade": 0.0,
-    "contract_size": 1,                # number of units per "share" (for futures)
-    "use_trailing_stop": True,
-    "partial_take_profit_pct": 0.5,    # take this fraction of position at first profit target
-    "take_profit_atr_multiplier": 4.0, # take-profit level in ATRs for first partial
-    "logging_level": logging.INFO,
+    "max_leverage": 1.0,  # maximum gross exposure (e.g., 1.0 = 100% of capital)
+    "risk_per_trade": 0.01,  # fraction of equity to risk per trade (1%)
+    "target_volatility_annual": 0.10,  # target annual volatility (10%) for volatility scaling
+    "volatility_lookback": 20,  # lookback for realized volatility / ATR
+    "atr_period": 14,  # ATR for stop sizing
+    "stop_atr_multiplier": 3.0,  # initial stop distance in ATR multiples
+    "trailing_stop_atr_multiplier": 2.0,  # trailing stop distance in ATR multiples
+    "sma_fast": 20,
+    "sma_slow": 100,
+    "ema_trend": 200,
+    "momentum_lookback": 5,
+    "min_signal_confirmation": 2,  # require signal to persist for N bars
+    "max_concurrent_positions": 1,  # single instrument system for simplicity
+    "max_drawdown_limit": 0.20,  # if drawdown exceeds 20%, stop further trading
+    "commission_per_trade": 1.0,  # flat commission or per trade fee
+    "slippage": 0.0005,  # proportion slippage
+    "verbose_logging": True,
+    "log_file": "trading_system.log",
 }
+
 
 # -------------------------
 # Logging (preserved)
 # -------------------------
 logger = logging.getLogger("TradingSystem")
-logger.setLevel(CONFIG["logging_level"])
+logger.setLevel(logging.DEBUG if CONFIG["verbose_logging"] else logging.INFO)
+formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+
+# Console handler
+ch = logging.StreamHandler()
+ch.setLevel(logging.DEBUG if CONFIG["verbose_logging"] else logging.INFO)
+ch.setFormatter(formatter)
 if not logger.handlers:
-    ch = logging.StreamHandler()
-    ch.setLevel(CONFIG["logging_level"])
-    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
-    ch.setFormatter(formatter)
     logger.addHandler(ch)
 
-
-# -------------------------
-# Helper indicators & metrics
-# -------------------------
-def atr(df: pd.DataFrame, length: int) -> pd.Series:
-    high = df["High"]
-    low = df["Low"]
-    close = df["Close"]
-    prev_close = close.shift(1)
-    tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
-    return tr.rolling(length, min_periods=1).mean()
-
-
-def ema(series: pd.Series, length: int) -> pd.Series:
-    return series.ewm(span=length, adjust=False).mean()
-
-
-def sharpe_ratio(returns: pd.Series, risk_free_rate: float = 0.0) -> float:
-    if returns.std() == 0:
-        return 0.0
-    ann_factor = 252 ** 0.5
-    return ((returns.mean() - risk_free_rate / 252) / returns.std()) * ann_factor
-
-
-def max_drawdown(equity_curve: pd.Series) -> float:
-    peak = equity_curve.cummax()
-    drawdown = (equity_curve - peak) / peak
-    return -drawdown.min()
+# File handler
+fh = logging.FileHandler(CONFIG["log_file"])
+fh.setLevel(logging.DEBUG)
+fh.setFormatter(formatter)
+logger.addHandler(fh)
 
 
 # -------------------------
-# Strategy (architecture preserved, improved signal & risk)
+# Data classes
 # -------------------------
-@dataclass
-class StrategyConfig:
-    initial_capital: float = CONFIG["initial_capital"]
-    risk_per_trade: float = CONFIG["risk_per_trade"]
-    max_position_size_pct: float = CONFIG["max_position_size_pct"]
-    atr_length: int = CONFIG["atr_length"]
-    atr_multiplier_stop: float = CONFIG["atr_multiplier_stop"]
-    atr_multiplier_trail: float = CONFIG["atr_multiplier_trail"]
-    ema_short: int = CONFIG["ema_short"]
-    ema_long: int = CONFIG["ema_long"]
-    ema_trend: int = CONFIG["ema_trend"]
-    volatility_filter_max_atr_pct: float = CONFIG["volatility_filter_max_atr_pct"]
-    min_trade_days_between: int = CONFIG["min_trade_days_between"]
-    max_drawdown_stop: float = CONFIG["max_drawdown_stop"]
-    slippage_per_share: float = CONFIG["slippage_per_share"]
-    commission_per_trade: float = CONFIG["commission_per_trade"]
-    contract_size: int = CONFIG["contract_size"]
-    use_trailing_stop: bool = CONFIG["use_trailing_stop"]
-    partial_take_profit_pct: float = CONFIG["partial_take_profit_pct"]
-    take_profit_atr_multiplier: float = CONFIG["take_profit_atr_multiplier"]
-
-
 @dataclass
 class Position:
+    entry_date: pd.Timestamp
+    side: int  # +1 long, -1 short
     entry_price: float
-    size: int
+    size: float  # number of shares / contracts
     stop_price: float
-    entry_index: int
-    highest_price: float = field(default=0.0)
-    partial_taken: bool = field(default=False)
-
-
-class Strategy:
-    def __init__(self, config: StrategyConfig):
-        self.cfg = config
-
-    def prepare_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        df = df.copy()
-        df["ATR"] = atr(df, self.cfg.atr_length)
-        df["EMA_short"] = ema(df["Close"], self.cfg.ema_short)
-        df["EMA_long"] = ema(df["Close"], self.cfg.ema_long)
-        df["EMA_trend"] = ema(df["Close"], self.cfg.ema_trend)
-        # Smoother signal: trend must be bullish and short EMA must cross long EMA
-        df["EMA_diff"] = df["EMA_short"] - df["EMA_long"]
-        df["EMA_diff_prev"] = df["EMA_diff"].shift(1)
-        df["bullish_cross"] = (df["EMA_diff"] > 0) & (df["EMA_diff_prev"] <= 0)
-        # Volatility as fraction of price
-        df["ATR_pct"] = df["ATR"] / df["Close"]
-        return df
-
-    def generate_signals(self, df: pd.DataFrame) -> pd.Series:
-        """
-        Returns '1' for long entry signals, '0' for no entry. This strategy only goes long.
-        """
-        df = self.prepare_indicators(df)
-        signals = pd.Series(0, index=df.index)
-        # Entry when EMA_short crosses EMA_long, overall trend (price above EMA_trend), and volatility acceptable
-        entry_mask = (
-            df["bullish_cross"]
-            & (df["Close"] > df["EMA_trend"])
-            & (df["ATR_pct"] <= self.cfg.volatility_filter_max_atr_pct)
-        )
-        signals[entry_mask] = 1
-        return signals, df
+    trailing_stop: Optional[float] = None
+    exit_date: Optional[pd.Timestamp] = None
+    exit_price: Optional[float] = None
+    pnl: Optional[float] = None
 
 
 # -------------------------
-# Trading engine / Backtester (preserved architecture, improved risk management)
+# Utility functions
 # -------------------------
-class Backtester:
-    def __init__(self, df: pd.DataFrame, strategy: Strategy, config: StrategyConfig):
-        self.df = df.copy().reset_index(drop=True)
-        self.strategy = strategy
-        self.cfg = config
-        self.cash = config.initial_capital
-        self.equity = config.initial_capital
-        self.position: Optional[Position] = None
-        self.equity_curve = []
-        self.position_history: List[Dict[str, Any]] = []
-        self.last_entry_idx: Optional[int] = None
-        self.trade_count = 0
-        self.halted_due_to_drawdown = False
+def calculate_atr(df: pd.DataFrame, period: int) -> pd.Series:
+    high_low = df["High"] - df["Low"]
+    high_close_prev = (df["High"] - df["Close"].shift(1)).abs()
+    low_close_prev = (df["Low"] - df["Close"].shift(1)).abs()
+    tr = pd.concat([high_low, high_close_prev, low_close_prev], axis=1).max(axis=1)
+    atr = tr.rolling(period, min_periods=1).mean()
+    return atr
 
-    def _can_enter(self, idx: int) -> bool:
-        if self.halted_due_to_drawdown:
-            logger.debug("New entries halted due to drawdown stop.")
-            return False
-        if self.last_entry_idx is not None:
-            if idx - self.last_entry_idx < self.cfg.min_trade_days_between:
-                logger.debug("Skipping entry: minimum days between trades not met.")
-                return False
-        return True
 
-    def _position_size_from_risk(self, equity: float, entry_price: float, stop_price: float) -> int:
+def annualize_volatility(returns: pd.Series, periods_per_year: int = 252) -> float:
+    if len(returns) < 2:
+        return 0.0
+    return returns.std() * math.sqrt(periods_per_year)
+
+
+def max_drawdown(series: pd.Series) -> float:
+    cummax = series.cummax()
+    drawdown = (series - cummax) / cummax
+    return drawdown.min()
+
+
+# -------------------------
+# Trading System class
+# -------------------------
+class TradingSystem:
+    def __init__(self, data: pd.DataFrame, config: Dict, logger: logging.Logger):
+        self.data = data.copy().reset_index(drop=False)
+        if "Date" not in self.data.columns:
+            # try to infer index as date
+            self.data.rename(columns={self.data.columns[0]: "Date"}, inplace=True)
+        self.data["Date"] = pd.to_datetime(self.data["Date"])
+        self.config = config
+        self.logger = logger
+
+        # State
+        self.equity = config["initial_capital"]
+        self.cash = config["initial_capital"]
+        self.positions: List[Position] = []
+        self.closed_positions: List[Position] = []
+        self.equity_curve: List[Dict] = []  # record date, equity, cash, position_value
+        self.current_position: Optional[Position] = None
+        self.signal_persistence = 0
+
+        # Precompute indicators
+        self._prepare_indicators()
+
+    def _prepare_indicators(self):
+        df = self.data
+        df["SMA_fast"] = df["Close"].rolling(self.config["sma_fast"], min_periods=1).mean()
+        df["SMA_slow"] = df["Close"].rolling(self.config["sma_slow"], min_periods=1).mean()
+        df["EMA_trend"] = df["Close"].ewm(span=self.config["ema_trend"], adjust=False).mean()
+        df["Momentum"] = df["Close"].pct_change(self.config["momentum_lookback"])
+        df["ATR"] = calculate_atr(df, self.config["atr_period"])
+        # daily returns for realized volatility
+        df["Return"] = df["Close"].pct_change().fillna(0)
+        df["RealizedVol"] = df["Return"].rolling(self.config["volatility_lookback"], min_periods=2).std()
+        self.data = df
+
+    def generate_signal(self, idx: int) -> int:
         """
-        Calculate position size based on the configured risk per trade and the distance to stop.
-        Caps position by max_position_size_pct of equity.
+        Generate a discrete signal: +1 (long), 0 (flat), -1 (short)
+        Improve entries by requiring:
+          - trend filter using EMA_trend
+          - SMA crossover confirmation
+          - momentum sign
         """
-        risk_amount = equity * self.cfg.risk_per_trade
-        per_unit_risk = abs(entry_price - stop_price) * self.cfg.contract_size
-        if per_unit_risk <= 0:
+        row = self.data.loc[idx]
+        # trend filter
+        price = row["Close"]
+        trend = 1 if price > row["EMA_trend"] else -1
+
+        sma_fast = row["SMA_fast"]
+        sma_slow = row["SMA_slow"]
+        momentum = row["Momentum"]
+
+        # Basic SMA crossover signal
+        if sma_fast > sma_slow and momentum > 0 and trend > 0:
+            return 1
+        elif sma_fast < sma_slow and momentum < 0 and trend < 0:
+            return -1
+        else:
             return 0
-        raw_size = math.floor(risk_amount / per_unit_risk)
-        # cap by maximum position size (in $)
-        max_notional = equity * self.cfg.max_position_size_pct
-        max_size_by_notional = math.floor(max_notional / (entry_price * self.cfg.contract_size))
-        size = max(0, min(raw_size, max_size_by_notional))
-        return size
 
-    def _enter_long(self, idx: int, price: float, atr: float):
-        # Determine stop and position sizing
-        stop_price = price - self.cfg.atr_multiplier_stop * atr
-        if stop_price <= 0:
-            logger.debug("Computed stop <= 0, aborting entry")
-            return False
-        size = self._position_size_from_risk(self.equity, price + self.cfg.slippage_per_share, stop_price)
-        if size <= 0:
-            logger.debug("Position size computed as 0, skipping entry.")
-            return False
-        # check sufficient cash (allow margin-like behavior up to equity limits)
-        cost = size * price * self.cfg.contract_size + self.cfg.commission_per_trade
-        if cost > (self.cash + self.equity):  # conservative check; in simple backtest we allow using equity
-            logger.debug("Insufficient funds for entry: cost=%s cash=%s equity=%s", cost, self.cash, self.equity)
-            return False
-        self.position = Position(entry_price=price, size=size, stop_price=stop_price, entry_index=idx, highest_price=price, partial_taken=False)
-        self.last_entry_idx = idx
-        self.trade_count += 1
-        logger.info("Entered long at idx=%d price=%.2f size=%d stop=%.2f", idx, price, size, stop_price)
-        # subtract commission
-        self.cash -= self.cfg.commission_per_trade
-        return True
-
-    def _exit_position(self, idx: int, price: float, reason: str):
-        pos = self.position
-        if pos is None:
-            return
-        pnl = (price - pos.entry_price) * pos.size * self.cfg.contract_size
-        # account for slippage and commission
-        pnl -= (self.cfg.slippage_per_share * pos.size * self.cfg.contract_size)
-        pnl -= self.cfg.commission_per_trade
-        self.cash += pos.size * price * self.cfg.contract_size + pnl - pos.size * pos.entry_price * self.cfg.contract_size
-        # For clarity: apply PnL directly to cash (we use equity tracking separately)
-        logger.info("Exited position at idx=%d price=%.2f size=%d pnl=%.2f reason=%s", idx, price, pos.size, pnl, reason)
-        self.position_history.append({
-            "entry_index": pos.entry_index,
-            "exit_index": idx,
-            "entry_price": pos.entry_price,
-            "exit_price": price,
-            "size": pos.size,
-            "pnl": pnl,
-            "reason": reason,
-        })
-        self.position = None
-
-    def _apply_trailing_stop(self, current_price: float, atr: float):
-        pos = self.position
-        if pos is None:
-            return
-        # update highest price
-        if current_price > pos.highest_price:
-            pos.highest_price = current_price
-        # trailing stop based on highest price
-        trail_stop = pos.highest_price - self.cfg.atr_multiplier_trail * atr
-        if trail_stop > pos.stop_price:
-            logger.debug("Trailing stop moved from %.2f to %.2f", pos.stop_price, trail_stop)
-            pos.stop_price = trail_stop
-
-    def run_backtest(self) -> Dict[str, Any]:
-        signals, df_ind = self.strategy.generate_signals(self.df)
-        df = df_ind  # includes indicators
-        n = len(df)
+    def position_size(self, price: float, atr: float, side: int) -> float:
+        """
+        Position sizing uses volatility targeting with a cap and risk-per-trade.
+        Size is computed so that expected ATR loss to stop * price * size <= risk_per_trade * equity
+        and also scales to target annual volatility.
+        """
         equity = self.equity
-        self.equity_curve = []
-        daily_returns = []
+        risk_per_trade = self.config["risk_per_trade"]
+        # If ATR is zero (flat), fallback to tiny size
+        if atr <= 0 or price <= 0:
+            return 0.0
 
+        # 1) Stop-based sizing: stop distance = stop_atr_multiplier * ATR
+        stop_distance = self.config["stop_atr_multiplier"] * atr
+        risk_amount = equity * risk_per_trade
+        size_stop_based = risk_amount / (stop_distance * price)
+
+        # 2) Volatility target sizing: position volatility = ATR/price (approx), scale to target
+        target_vol = self.config["target_volatility_annual"]
+        # approximate current daily vol
+        daily_vol = atr / price if price > 0 else 0.0
+        if daily_vol > 0:
+            # scaling factor to reach target annual vol (sqrt(252))
+            scale = target_vol / (daily_vol * math.sqrt(252))
+            size_vol_based = (equity * self.config["max_leverage"] * scale) / price
+        else:
+            size_vol_based = size_stop_based
+
+        # Choose conservative min of methods, apply max leverage and ensure integer number of shares/contracts
+        size = min(abs(size_stop_based), abs(size_vol_based))
+        max_size = (equity * self.config["max_leverage"]) / price
+        size = max(min(size, max_size), 0.0)
+
+        # enforce at least zero
+        return math.floor(size)  # integer shares/contracts
+
+    def enter_position(self, idx: int, side: int):
+        if self.current_position is not None:
+            # we only allow one position in this simple system
+            return
+
+        row = self.data.loc[idx]
+        price = row["Close"] * (1 + self.config["slippage"] * side)  # slippage applied to side
+        atr = row["ATR"]
+        size = self.position_size(price, atr, side)
+        if size <= 0:
+            self.logger.debug(f"Skipping entry at {row['Date']} due to zero size (atr={atr}, price={price}).")
+            return
+
+        stop_distance = self.config["stop_atr_multiplier"] * atr
+        if side == 1:
+            stop_price = price - stop_distance
+            trailing_stop = price - self.config["trailing_stop_atr_multiplier"] * atr
+        else:
+            stop_price = price + stop_distance
+            trailing_stop = price + self.config["trailing_stop_atr_multiplier"] * atr
+
+        position = Position(
+            entry_date=row["Date"],
+            side=side,
+            entry_price=price,
+            size=size,
+            stop_price=stop_price,
+            trailing_stop=trailing_stop,
+        )
+        # Allocate cash (we assume full margin; flat commission)
+        position_value = price * size
+        if position_value > self.cash + 1e-8:  # simple cash check without leverage facilities
+            # If not enough cash, scale down size
+            affordable_size = math.floor(self.cash / price)
+            if affordable_size <= 0:
+                self.logger.debug(f"Not enough cash to enter position at {row['Date']} (cash={self.cash}, price={price}).")
+                return
+            position.size = affordable_size
+            position_value = price * affordable_size
+
+        # Deduct cash for position (conservative)
+        self.cash -= position_value + self.config["commission_per_trade"]
+        self.current_position = position
+        self.positions.append(position)
+        self.logger.info(f"ENTER {row['Date']} side={side} price={price:.2f} size={position.size} stop={position.stop_price:.2f}")
+
+    def exit_position(self, idx: int, reason: str):
+        if self.current_position is None:
+            return
+        row = self.data.loc[idx]
+        price = row["Close"] * (1 - self.config["slippage"] * self.current_position.side)  # slippage on exit
+        # Close
+        pnl = (price - self.current_position.entry_price) * self.current_position.size * self.current_position.side
+        self.cash += price * self.current_position.size - self.config["commission_per_trade"]
+        self.current_position.exit_date = row["Date"]
+        self.current_position.exit_price = price
+        self.current_position.pnl = pnl
+        self.closed_positions.append(self.current_position)
+        self.logger.info(f"EXIT {row['Date']} side={self.current_position.side} price={price:.2f} size={self.current_position.size} pnl={pnl:.2f} reason={reason}")
+        self.current_position = None
+
+    def update_trailing_stop(self, idx: int):
+        if self.current_position is None:
+            return
+        row = self.data.loc[idx]
+        price = row["Close"]
+        atr = row["ATR"]
+        if atr <= 0:
+            return
+        # For long positions, trailing stop moves up with price; for short, moves down
+        if self.current_position.side == 1:
+            new_trail = price - self.config["trailing_stop_atr_multiplier"] * atr
+            if new_trail > (self.current_position.trailing_stop or -np.inf):
+                self.current_position.trailing_stop = new_trail
+        else:
+            new_trail = price + self.config["trailing_stop_atr_multiplier"] * atr
+            if new_trail < (self.current_position.trailing_stop or np.inf):
+                self.current_position.trailing_stop = new_trail
+
+    def check_stop_conditions(self, idx: int):
+        """
+        Check both initial stop and trailing stop. Exit if any is hit.
+        """
+        if self.current_position is None:
+            return
+        row = self.data.loc[idx]
+        low = row["Low"]
+        high = row["High"]
+
+        # For long
+        if self.current_position.side == 1:
+            # initial stop
+            if low <= self.current_position.stop_price:
+                self.exit_position(idx, reason="stop_hit_initial")
+                return
+            # trailing stop
+            if self.current_position.trailing_stop is not None and low <= self.current_position.trailing_stop:
+                self.exit_position(idx, reason="stop_hit_trailing")
+                return
+        else:
+            # short
+            if high >= self.current_position.stop_price:
+                self.exit_position(idx, reason="stop_hit_initial")
+                return
+            if self.current_position.trailing_stop is not None and high >= self.current_position.trailing_stop:
+                self.exit_position(idx, reason="stop_hit_trailing")
+                return
+
+    def record_equity(self, idx: int):
+        row = self.data.loc[idx]
+        pos_value = 0.0
+        if self.current_position is not None:
+            # mark to market
+            pos_value = self.current_position.entry_price * self.current_position.size * self.current_position.side
+            # better: use current price
+            pos_value = self.current_position.size * row["Close"] * self.current_position.side
+        equity = self.cash + pos_value
+        self.equity = equity
+        self.equity_curve.append({"Date": row["Date"], "Equity": equity, "Cash": self.cash, "PositionValue": pos_value})
+
+    def should_halt_trading(self) -> bool:
+        # Stop trading if drawdown crossed threshold
+        if not self.equity_curve:
+            return False
+        equity_series = pd.Series([x["Equity"] for x in self.equity_curve])
+        dd = -max_drawdown(equity_series)
+        if dd >= self.config["max_drawdown_limit"]:
+            self.logger.warning(f"Halting trading: drawdown {dd:.2%} >= limit {self.config['max_drawdown_limit']:.2%}")
+            return True
+        return False
+
+    def run_backtest(self):
+        df = self.data
+        n = len(df)
+        self.logger.info("Starting backtest")
         for idx in range(n):
-            row = df.iloc[idx]
-            price = row["Close"]
-            atr_val = row["ATR"]
-            date_info = df.index[idx] if hasattr(df.index, "values") else idx
+            date = df.loc[idx, "Date"]
 
-            # Check for new entry
-            if signals.iloc[idx] == 1 and self.position is None and self._can_enter(idx):
-                # safety: skip if recent big drawdown exceeded
-                if max_drawdown(pd.Series(self.equity_curve)) if len(self.equity_curve) > 0 else 0.0 > self.cfg.max_drawdown_stop:
-                    logger.warning("Max drawdown threshold exceeded; halting new entries.")
-                    self.halted_due_to_drawdown = True
-                if not self.halted_due_to_drawdown:
-                    entered = self._enter_long(idx, price + self.cfg.slippage_per_share, atr_val)
-                    if entered:
-                        # upon entry we don't immediately debit cash by notional in this simple backtest;
-                        # P&L will be settled upon exit. Commission already debited.
-                        pass
+            # Update trailing stop based on latest price
+            self.update_trailing_stop(idx)
 
-            # Manage existing position
-            if self.position is not None:
-                pos = self.position
-                # trailing stop adjustment
-                if self.cfg.use_trailing_stop:
-                    self._apply_trailing_stop(price, atr_val)
+            # Check stop hits
+            self.check_stop_conditions(idx)
 
-                # Check stop-loss hit
-                if price <= pos.stop_price:
-                    self._exit_position(idx, pos.stop_price, reason="stop_hit")
+            # Record equity before new entries/exits at this bar's close
+            self.record_equity(idx)
+
+            # Risk check
+            if self.should_halt_trading():
+                break
+
+            # Generate signal
+            signal = self.generate_signal(idx)
+
+            # Require persistence for entries (reduce whipsaw)
+            if signal != 0:
+                # If same direction as previous signal, increment persistence, else reset
+                last_sign = getattr(self, "_last_signal", 0)
+                if signal == last_sign:
+                    self.signal_persistence += 1
                 else:
-                    # Partial profit taking: if price reaches take-profit threshold
-                    if (not pos.partial_taken) and (price >= pos.entry_price + self.cfg.take_profit_atr_multiplier * atr_val):
-                        take_amount = math.floor(pos.size * self.cfg.partial_take_profit_pct)
-                        if take_amount > 0:
-                            # simulate taking profit on part of the position
-                            pnl_partial = (price - pos.entry_price) * take_amount * self.cfg.contract_size
-                            pnl_partial -= (self.cfg.slippage_per_share * take_amount * self.cfg.contract_size)
-                            pnl_partial -= self.cfg.commission_per_trade
-                            # reduce position size and credit cash
-                            pos.size -= take_amount
-                            pos.partial_taken = True
-                            self.cash += pnl_partial + take_amount * price * self.cfg.contract_size - take_amount * pos.entry_price * self.cfg.contract_size
-                            logger.info("Partial take-profit at idx=%d price=%.2f taken=%d pnl=%.2f", idx, price, take_amount, pnl_partial)
-                            # if nothing left, close entirely
-                            if pos.size <= 0:
-                                self._exit_position(idx, price, reason="partial_exit_all")
-                                continue
+                    self.signal_persistence = 1
+                self._last_signal = signal
+            else:
+                self.signal_persistence = 0
+                self._last_signal = 0
 
-            # Update equity: mark-to-market current position
-            mtm = 0.0
-            if self.position is not None:
-                pos = self.position
-                mtm = (price - pos.entry_price) * pos.size * self.cfg.contract_size
-                # do not double-count commissions; they were applied at entry/partial/exit
-            equity = self.cash + (pos.size * price * self.cfg.contract_size if self.position else 0)
-            self.equity_curve.append(equity)
-            # compute daily return compared to previous equity if available
-            if len(self.equity_curve) > 1:
-                ret = (self.equity_curve[-1] - self.equity_curve[-2]) / max(self.equity_curve[-2], 1e-6)
-                daily_returns.append(ret)
+            # Entry logic
+            if self.current_position is None and abs(signal) > 0 and self.signal_persistence >= self.config["min_signal_confirmation"]:
+                # enter with signal direction
+                self.enter_position(idx, signal)
 
-            # Enforce absolute capital-based stop: if drawdown beyond absolute threshold, halt entries
-            if len(self.equity_curve) > 1:
-                dd = max_drawdown(pd.Series(self.equity_curve))
-                if dd >= self.cfg.max_drawdown_stop:
-                    if not self.halted_due_to_drawdown:
-                        logger.warning("Drawdown %.2f exceeded threshold %.2f: halting new entries.", dd, self.cfg.max_drawdown_stop)
-                    self.halted_due_to_drawdown = True
+            # Exit logic based on reversed confirmed signal
+            if self.current_position is not None:
+                # if reversed signal is persistent, exit
+                if signal == -self.current_position.side and self.signal_persistence >= self.config["min_signal_confirmation"]:
+                    self.exit_position(idx, reason="signal_reversal")
 
-        # End of loop: if position still open, close at last close price
-        if self.position is not None:
-            final_price = df.iloc[-1]["Close"]
-            self._exit_position(n - 1, final_price, reason="end_of_data")
-            equity = self.cash
-            self.equity_curve[-1] = equity
+        # At end of backtest, close any open positions at last close
+        if self.current_position is not None:
+            idx = len(self.data) - 1
+            self.exit_position(idx, reason="end_of_backtest")
+            self.record_equity(idx)
 
-        equity_series = pd.Series(self.equity_curve)
-        stats = {
-            "final_equity": equity_series.iloc[-1] if len(equity_series) > 0 else self.equity,
-            "returns_series": pd.Series(daily_returns) if daily_returns else pd.Series(dtype=float),
-            "sharpe": sharpe_ratio(pd.Series(daily_returns)) if daily_returns else 0.0,
-            "max_drawdown": max_drawdown(equity_series) if len(equity_series) > 0 else 0.0,
-            "trade_count": self.trade_count,
-            "position_history": self.position_history,
-            "equity_curve": equity_series,
+        self.logger.info("Backtest complete")
+        return self.results()
+
+    def results(self) -> Dict:
+        df_equity = pd.DataFrame(self.equity_curve).set_index("Date")
+        df_equity["Returns"] = df_equity["Equity"].pct_change().fillna(0)
+        total_return = (df_equity["Equity"].iloc[-1] / df_equity["Equity"].iloc[0]) - 1 if len(df_equity) >= 2 else 0.0
+        annual_factor = 252 / len(df_equity) * len(df_equity) if len(df_equity) > 0 else 1
+        # Compute annualized return and volatility robustly
+        ann_return = (1 + total_return) ** (252 / len(df_equity)) - 1 if len(df_equity) > 1 else 0.0
+        ann_vol = annualize_volatility(df_equity["Returns"], periods_per_year=252)
+        sharpe = (ann_return / ann_vol) if ann_vol > 0 else 0.0
+        # Sortino: downside deviation
+        neg_returns = df_equity["Returns"].loc[df_equity["Returns"] < 0]
+        downside_dev = neg_returns.std() * math.sqrt(252) if len(neg_returns) > 0 else 0.0
+        sortino = (ann_return / downside_dev) if downside_dev > 0 else 0.0
+        dd = -max_drawdown(df_equity["Equity"])
+
+        trades = pd.DataFrame([asdict(p) for p in self.closed_positions])
+        num_trades = len(trades)
+        wins = trades[trades["pnl"] > 0] if not trades.empty else trades
+        win_rate = len(wins) / num_trades if num_trades > 0 else 0.0
+        avg_win = wins["pnl"].mean() if not wins.empty else 0.0
+        avg_loss = trades[trades["pnl"] <= 0]["pnl"].mean() if not trades.empty else 0.0
+
+        results = {
+            "total_return": total_return,
+            "annual_return": ann_return,
+            "annual_volatility": ann_vol,
+            "sharpe": sharpe,
+            "sortino": sortino,
+            "max_drawdown": dd,
+            "num_trades": num_trades,
+            "win_rate": win_rate,
+            "avg_win": avg_win,
+            "avg_loss": avg_loss,
+            "equity_curve": df_equity,
+            "trades": trades,
         }
-        logger.info("Backtest complete: final_equity=%.2f trades=%d sharpe=%.2f max_dd=%.2f", stats["final_equity"], stats["trade_count"], stats["sharpe"], stats["max_drawdown"])
-        return stats
+
+        self.logger.info(f"Results: Total Return: {total_return:.2%}, Annual Return: {ann_return:.2%}, "
+                         f"Vol: {ann_vol:.2%}, Sharpe: {sharpe:.2f}, Sortino: {sortino:.2f}, Drawdown: {dd:.2%}, "
+                         f"Trades: {num_trades}, WinRate: {win_rate:.2%}")
+
+        return results
 
 
 # -------------------------
-# Main execution helper (preserved)
+# Entry point for running/backtesting
 # -------------------------
-def run_trading_system(price_df: pd.DataFrame, cfg_dict: Dict[str, Any] = None) -> Dict[str, Any]:
-    """
-    price_df must be a DataFrame with columns: ['Open','High','Low','Close','Volume']
-    """
-    if cfg_dict is None:
-        cfg_dict = CONFIG
-    cfg = StrategyConfig(**cfg_dict)
-    strategy = Strategy(cfg)
-    backtester = Backtester(price_df, strategy, cfg)
-    results = backtester.run_backtest()
-    return results
+def load_data_csv(path: str) -> pd.DataFrame:
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"CSV file not found: {path}")
+    df = pd.read_csv(path)
+    # Expect columns: Date, Open, High, Low, Close, Volume (at least)
+    expected = {"Date", "Open", "High", "Low", "Close"}
+    if not expected.issubset(set(df.columns)):
+        raise ValueError(f"CSV missing required columns. Found: {df.columns}")
+    df = df.loc[:, ["Date", "Open", "High", "Low", "Close"]]
+    return df
 
 
-# -------------------------
-# Example usage (kept as reference, commented to preserve module importability)
-# -------------------------
 if __name__ == "__main__":
-    # Example: generate synthetic data or load from CSV for demonstration
-    import datetime as dt
+    # Simple example usage; replace 'data.csv' with your historical data file
+    DATA_FILE = "data.csv"
+    try:
+        data = load_data_csv(DATA_FILE)
+    except Exception as e:
+        logger.error(f"Unable to load data file {DATA_FILE}: {e}")
+        # Create a minimal synthetic dataset to allow code to run (useful for testing)
+        dates = pd.date_range(end=datetime.today(), periods=300, freq="B")
+        price = np.cumprod(1 + np.random.normal(0, 0.001, size=len(dates))) * 100
+        data = pd.DataFrame({
+            "Date": dates,
+            "Open": price * (1 + np.random.normal(0, 0.001, size=len(dates))),
+            "High": price * (1 + np.abs(np.random.normal(0, 0.002, size=len(dates)))),
+            "Low": price * (1 - np.abs(np.random.normal(0, 0.002, size=len(dates)))),
+            "Close": price,
+        })
+        logger.info("Using synthetic data for demonstration.")
 
-    dates = pd.date_range(start=dt.date(2018, 1, 1), periods=500, freq="B")
-    np.random.seed(42)
-    price = np.cumprod(1 + np.random.normal(0.0005, 0.01, len(dates))) * 100
-    high = price * (1 + np.random.uniform(0.0, 0.01, len(dates)))
-    low = price * (1 - np.random.uniform(0.0, 0.01, len(dates)))
-    openp = price * (1 + np.random.uniform(-0.005, 0.005, len(dates)))
-    volume = np.random.randint(100, 1000, len(dates))
+    ts = TradingSystem(data, CONFIG, logger)
+    results = ts.run_backtest()
 
-    df = pd.DataFrame({
-        "Open": openp,
-        "High": high,
-        "Low": low,
-        "Close": price,
-        "Volume": volume,
-    }, index=dates)
-
-    results = run_trading_system(df)
-    logger.info("Example run: final equity %.2f, trades %d, max drawdown %.2f, sharpe %.2f",
-                results["final_equity"], results["trade_count"], results["max_drawdown"], results["sharpe"])
+    # Example: save results to CSVs while preserving logging/config
+    out_dir = "backtest_results"
+    os.makedirs(out_dir, exist_ok=True)
+    results["equity_curve"].to_csv(os.path.join(out_dir, "equity_curve.csv"))
+    if not results["trades"].empty:
+        results["trades"].to_csv(os.path.join(out_dir, "trades.csv"), index=False)
+    # Save config snapshot
+    pd.Series(CONFIG).to_csv(os.path.join(out_dir, "config_snapshot.csv"))
+    logger.info(f"Backtest artifacts written to {out_dir}")
